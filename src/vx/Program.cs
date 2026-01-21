@@ -6,6 +6,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
@@ -70,7 +71,9 @@ internal static class Program
         Console.WriteLine("  vx view <filename>");
         Console.WriteLine("  vx view !ProjectName:<filename>");
         Console.WriteLine("  vx ls us | cl | ns | mt:ClassName");
-        Console.WriteLine("  vx build | rebuild | clean");
+        Console.WriteLine("  vx build [projectPattern]");
+        Console.WriteLine("  vx rebuild [projectPattern]");
+        Console.WriteLine("  vx clean [projectPattern]");
         Console.WriteLine("  vx !ProjectName:build|rebuild|clean|deploy");
         Console.WriteLine();
         Console.WriteLine("Commands:");
@@ -78,9 +81,9 @@ internal static class Program
         Console.WriteLine("  open   Open a solution in Visual Studio 2022.");
         Console.WriteLine("  view   Open a file in the active solution.");
         Console.WriteLine("  ls     List items from the active document.");
-        Console.WriteLine("  build  Build the active solution.");
-        Console.WriteLine("  rebuild Rebuild the active solution.");
-        Console.WriteLine("  clean  Clean the active solution.");
+        Console.WriteLine("  build  Build the active solution or matching project.");
+        Console.WriteLine("  rebuild Rebuild the active solution or matching project.");
+        Console.WriteLine("  clean  Clean the active solution or matching project.");
     }
 
     private static int RunInfo(string[] args)
@@ -293,7 +296,7 @@ internal static class Program
             dynamic? project = null;
             if (!string.IsNullOrWhiteSpace(projectName))
             {
-                project = FindProjectByName(solution, projectName);
+                project = FindProjectBySelector(solution, projectName);
                 if (project == null)
                 {
                     Console.Error.WriteLine($"Project not found: {projectName}");
@@ -460,13 +463,32 @@ internal static class Program
 
     private static int RunSolutionBuild(string action, string[] args)
     {
-        if (args.Length > 0)
+        if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: vx build | rebuild | clean");
-            return 1;
+            return ExecuteBuildAction(action, null);
         }
 
-        return ExecuteBuildAction(action, null);
+        if (args.Length == 1)
+        {
+            var selector = args[0].Trim();
+            if (selector.StartsWith("!", StringComparison.Ordinal))
+            {
+                selector = selector.Substring(1).Trim();
+            }
+
+            if (string.IsNullOrWhiteSpace(selector))
+            {
+                Console.Error.WriteLine("Usage: vx build|rebuild|clean [projectPattern]");
+                return 1;
+            }
+
+            return ExecuteBuildAction(action, selector);
+        }
+
+        {
+            Console.Error.WriteLine("Usage: vx build|rebuild|clean [projectPattern]");
+            return 1;
+        }
     }
 
     private static int RunProjectBuildCommand(string[] args)
@@ -560,16 +582,17 @@ internal static class Program
                 return result;
             }
 
-            var project = FindProjectByName(solution, projectName);
+            var project = FindProjectBySelector(solution, projectName);
             if (project == null)
             {
                 Console.Error.WriteLine($"Project not found: {projectName}");
                 return 1;
             }
 
+            var projectDisplayName = TryGetValue(() => (string?)project.Name) ?? projectName;
             var projectUniqueName = TryGetValue(() => (string?)project.UniqueName)
                 ?? TryGetValue(() => (string?)project.FullName)
-                ?? TryGetValue(() => (string?)project.Name);
+                ?? projectDisplayName;
 
             if (string.IsNullOrWhiteSpace(projectUniqueName))
             {
@@ -584,10 +607,10 @@ internal static class Program
                 return 1;
             }
 
-            var projectResult = ExecuteProjectBuildAction(build, action, configurationName, projectUniqueName, projectName);
+            var projectResult = ExecuteProjectBuildAction(build, action, configurationName, projectUniqueName, projectDisplayName);
             if (projectResult == 0)
             {
-                ReportBuildResult(action, build, configurationName, projectName);
+                ReportBuildResult(action, build, configurationName, projectDisplayName);
             }
 
             return projectResult;
@@ -968,13 +991,15 @@ internal static class Program
 
     private const string SolutionFolderKind = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
 
-    private static dynamic? FindProjectByName(dynamic solution, string projectName)
+    private static dynamic? FindProjectBySelector(dynamic solution, string projectSelector)
     {
         var projects = TryGetValue(() => (dynamic)solution.Projects);
         foreach (var project in EnumerateProjects(projects))
         {
             var name = TryGetValue(() => (string?)project.Name);
-            if (string.Equals(name, projectName, StringComparison.OrdinalIgnoreCase))
+            var uniqueName = TryGetValue(() => (string?)project.UniqueName);
+            var fullName = TryGetValue(() => (string?)project.FullName);
+            if (IsProjectMatch(projectSelector, name, uniqueName, fullName))
             {
                 return project;
             }
@@ -1200,6 +1225,61 @@ internal static class Program
         }
 
         return null;
+    }
+
+    private static bool IsProjectMatch(string selector, string? name, string? uniqueName, string? fullName)
+    {
+        if (string.IsNullOrWhiteSpace(selector))
+        {
+            return false;
+        }
+
+        var pattern = selector.Trim();
+        var hasWildcard = pattern.Contains('*');
+
+        bool Match(string? candidate)
+        {
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                return false;
+            }
+
+            return hasWildcard
+                ? IsWildcardMatch(candidate, pattern)
+                : string.Equals(candidate, pattern, StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (Match(name) || Match(uniqueName) || Match(fullName))
+        {
+            return true;
+        }
+
+        if (!string.IsNullOrWhiteSpace(fullName))
+        {
+            var fileName = Path.GetFileNameWithoutExtension(fullName);
+            if (Match(fileName))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsWildcardMatch(string input, string pattern)
+    {
+        if (string.IsNullOrWhiteSpace(pattern))
+        {
+            return false;
+        }
+
+        if (pattern == "*")
+        {
+            return true;
+        }
+
+        var regexPattern = "^" + Regex.Escape(pattern).Replace("\\*", ".*") + "$";
+        return Regex.IsMatch(input ?? string.Empty, regexPattern, RegexOptions.IgnoreCase);
     }
 
     private static IEnumerable<dynamic> EnumerateComCollection(dynamic collection)

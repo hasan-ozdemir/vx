@@ -24,6 +24,8 @@ dotnet run --project src/vx -- ls mt:MainPage
 dotnet run --project src/vx -- build
 dotnet run --project src/vx -- rebuild
 dotnet run --project src/vx -- clean
+dotnet run --project src/vx -- build bot*
+dotnet run --project src/vx -- build !*ios
 dotnet run --project src/vx -- !BotyumApp:build
 dotnet run --project src/vx -- !BotyumApp:rebuild
 dotnet run --project src/vx -- !BotyumApp:clean
@@ -52,6 +54,6 @@ Options:
 `vx ls us|cl|ns` lists using directives, class names, or namespaces from the active document.
 `vx ls mt:ClassName` lists methods under the specified class in the active document.
 
-`vx build`, `vx rebuild`, and `vx clean` operate on the active solution.
-`vx !ProjectName:build|rebuild|clean|deploy` runs the action for a specific project in the active solution.
+`vx build`, `vx rebuild`, and `vx clean` operate on the active solution. Add a project pattern to target the first match (wildcard `*` supported).
+`vx !ProjectName:build|rebuild|clean|deploy` runs the action for a specific project in the active solution (wildcard `*` supported in the project name).
 
