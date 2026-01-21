@@ -22,12 +22,12 @@ internal static class Program
             return 0;
         }
 
-        if (args[0].StartsWith("!", StringComparison.Ordinal))
+        if (args[0].Trim().StartsWith("!", StringComparison.Ordinal))
         {
             return RunProjectBuildCommand(args);
         }
 
-        var command = args[0].ToLowerInvariant();
+        var command = args[0].Trim().ToLowerInvariant();
         switch (command)
         {
             case "info":
@@ -64,7 +64,10 @@ internal static class Program
             return true;
         }
 
-        return arg is "-h" or "--help" or "help" or "/?";
+        return string.Equals(arg, "-h", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(arg, "--help", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(arg, "help", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(arg, "/?", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void PrintHelp()
