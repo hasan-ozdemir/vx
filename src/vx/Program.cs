@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
@@ -22,6 +23,8 @@ internal static class Program
         {
             case "info":
                 return RunInfo(args.Skip(1).ToArray());
+            case "open":
+                return RunOpen(args.Skip(1).ToArray());
             default:
                 Console.Error.WriteLine($"Unknown command: {args[0]}");
                 PrintHelp();
@@ -45,9 +48,11 @@ internal static class Program
         Console.WriteLine();
         Console.WriteLine("Usage:");
         Console.WriteLine("  vx info [--all] [--instance N] [--json]");
+        Console.WriteLine("  vx open solution <path>");
         Console.WriteLine();
         Console.WriteLine("Commands:");
         Console.WriteLine("  info   Show details about running VS2022 instances.");
+        Console.WriteLine("  open   Open a solution in Visual Studio 2022.");
     }
 
     private static int RunInfo(string[] args)
@@ -128,6 +133,110 @@ internal static class Program
 
         VsRot.ReleaseInstances(instances);
         return 0;
+    }
+
+    private static int RunOpen(string[] args)
+    {
+        if (args.Length < 2 || !string.Equals(args[0], "solution", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Error.WriteLine("Usage: vx open solution <path>");
+            return 1;
+        }
+
+        var rawPath = string.Join(" ", args.Skip(1)).Trim();
+        if (string.IsNullOrWhiteSpace(rawPath))
+        {
+            Console.Error.WriteLine("Missing solution path.");
+            return 1;
+        }
+
+        var expandedPath = Environment.ExpandEnvironmentVariables(rawPath);
+        var fullPath = Path.GetFullPath(expandedPath);
+        if (!File.Exists(fullPath))
+        {
+            Console.Error.WriteLine($"Solution not found: {fullPath}");
+            return 1;
+        }
+
+        var instances = VsRot.GetRunningDteInstances();
+        try
+        {
+            if (instances.Count > 0)
+            {
+                var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
+                if (target.Dte == null)
+                {
+                    Console.Error.WriteLine("Failed to access running Visual Studio instance.");
+                    return 1;
+                }
+
+                OpenInExistingInstance(target.Dte, fullPath);
+                return 0;
+            }
+
+            OpenInNewInstance(fullPath);
+            return 0;
+        }
+        catch (COMException ex)
+        {
+            Console.Error.WriteLine($"Visual Studio automation error: {ex.Message}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            return 1;
+        }
+        finally
+        {
+            VsRot.ReleaseInstances(instances);
+        }
+    }
+
+    private static void OpenInExistingInstance(object dteObject, string solutionPath)
+    {
+        dynamic dte = dteObject;
+        dte.Solution.Open(solutionPath);
+        TryActivateMainWindow(dte);
+    }
+
+    private static void OpenInNewInstance(string solutionPath)
+    {
+        object? dteObject = null;
+        try
+        {
+            var type = Type.GetTypeFromProgID("VisualStudio.DTE.17.0", true);
+            dteObject = Activator.CreateInstance(type!, true);
+            if (dteObject == null)
+            {
+                throw new InvalidOperationException("Failed to create Visual Studio instance.");
+            }
+
+            dynamic dte = dteObject;
+            dte.MainWindow.Visible = true;
+            dte.UserControl = true;
+            dte.Solution.Open(solutionPath);
+            TryActivateMainWindow(dte);
+        }
+        finally
+        {
+            if (dteObject != null && Marshal.IsComObject(dteObject))
+            {
+                Marshal.FinalReleaseComObject(dteObject);
+            }
+        }
+    }
+
+    private static void TryActivateMainWindow(dynamic dte)
+    {
+        try
+        {
+            dte.MainWindow.Activate();
+        }
+        catch
+        {
+            // Ignore activation failures.
+        }
     }
 
     private static void WriteJson(VxInfoSnapshot info)
@@ -589,6 +698,22 @@ internal static class VsSelector
         }
 
         return -1;
+    }
+
+    public static VsInstance? GetActiveInstance(List<VsInstance> instances)
+    {
+        if (instances == null || instances.Count == 0)
+        {
+            return null;
+        }
+
+        var activeIndex = GetActiveIndex(instances);
+        if (activeIndex >= 0 && activeIndex < instances.Count)
+        {
+            return instances[activeIndex];
+        }
+
+        return instances[0];
     }
 
     private static int? TryGetWindowHandle(object? dte)

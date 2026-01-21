@@ -14,6 +14,7 @@ dotnet build VxRemoteControl.sln
 
 ```
 dotnet run --project src/vx -- info
+dotnet run --project src/vx -- open solution C:\path\to\MySolution.sln
 ```
 
 Options:
@@ -29,4 +30,6 @@ Options:
 - Solution name/path + active configuration
 - Project list with kinds
 - Open documents + active document
+
+`vx open solution <path>` opens the solution in the active VS2022 instance (or starts a new instance if none are running).
 
