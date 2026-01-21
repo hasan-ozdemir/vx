@@ -551,7 +551,13 @@ internal static class Program
 
             if (string.IsNullOrWhiteSpace(projectName))
             {
-                return ExecuteSolutionBuildAction(dte, build, action);
+                var result = ExecuteSolutionBuildAction(dte, build, action);
+                if (result == 0)
+                {
+                    ReportBuildResult(action, build, GetActiveSolutionConfiguration(build), null);
+                }
+
+                return result;
             }
 
             var project = FindProjectByName(solution, projectName);
@@ -578,7 +584,13 @@ internal static class Program
                 return 1;
             }
 
-            return ExecuteProjectBuildAction(build, action, configurationName, projectUniqueName, projectName);
+            var projectResult = ExecuteProjectBuildAction(build, action, configurationName, projectUniqueName, projectName);
+            if (projectResult == 0)
+            {
+                ReportBuildResult(action, build, configurationName, projectName);
+            }
+
+            return projectResult;
         }
         catch (COMException ex)
         {
@@ -705,6 +717,33 @@ internal static class Program
         }
 
         return name;
+    }
+
+    private static void ReportBuildResult(string action, dynamic build, string? configuration, string? projectName)
+    {
+        var lastBuildInfo = TryGetValue(() => (int)build.LastBuildInfo, -1);
+        var buildState = TryGetValue(() => build.BuildState)?.ToString();
+
+        Console.WriteLine($"{action} completed.");
+        if (!string.IsNullOrWhiteSpace(configuration))
+        {
+            Console.WriteLine($"  Configuration: {configuration}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(projectName))
+        {
+            Console.WriteLine($"  Project: {projectName}");
+        }
+
+        if (lastBuildInfo >= 0)
+        {
+            Console.WriteLine($"  Errors: {lastBuildInfo}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(buildState))
+        {
+            Console.WriteLine($"  Build state: {buildState}");
+        }
     }
 
     private static bool TryInvoke(Action action, out string? error)
