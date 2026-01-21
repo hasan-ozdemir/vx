@@ -30,6 +30,9 @@ dotnet run --project src/vx -- deploy !*ios
 dotnet run --project src/vx -- startup !*ios
 dotnet run --project src/vx -- startups !*ios;!*api*
 dotnet run --project src/vx -- startups !*ios !*api*
+dotnet run --project src/vx -- props list !BotyumApp
+dotnet run --project src/vx -- props set !BotyumApp
+dotnet run --project src/vx -- props set
 dotnet run --project src/vx -- !BotyumApp:build
 dotnet run --project src/vx -- !BotyumApp:rebuild
 dotnet run --project src/vx -- !BotyumApp:clean
@@ -63,4 +66,7 @@ Options:
 `vx startup !projectPattern` sets the startup project by pattern.
 `vx startups !pattern1;!pattern2` (quote the argument in PowerShell) or `vx startups !pattern1 !pattern2` sets multiple startup projects by patterns.
 `vx !ProjectName:build|rebuild|clean|deploy` runs the action for a specific project in the active solution (wildcard `*` supported in the project name).
+
+`vx props list !projectPattern` lists project properties by page.
+`vx props set [!projectPattern]` launches an interactive wizard to update properties (press `b` to go back, `q` to quit).
 

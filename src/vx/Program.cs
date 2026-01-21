@@ -50,6 +50,8 @@ internal static class Program
                 return RunStartup(args.Skip(1).ToArray());
             case "startups":
                 return RunStartups(args.Skip(1).ToArray());
+            case "props":
+                return RunProps(args.Skip(1).ToArray());
             default:
                 Console.Error.WriteLine($"Unknown command: {args[0]}");
                 PrintHelp();
@@ -86,6 +88,8 @@ internal static class Program
         Console.WriteLine("  vx deploy !projectPattern");
         Console.WriteLine("  vx startup !projectPattern");
         Console.WriteLine("  vx startups !pattern1;!pattern2");
+        Console.WriteLine("  vx props list !projectPattern");
+        Console.WriteLine("  vx props set [!projectPattern]");
         Console.WriteLine("  vx !ProjectName:build|rebuild|clean|deploy");
         Console.WriteLine();
         Console.WriteLine("Commands:");
@@ -99,6 +103,7 @@ internal static class Program
         Console.WriteLine("  deploy Deploy a matching project.");
         Console.WriteLine("  startup Set the startup project.");
         Console.WriteLine("  startups Set multiple startup projects.");
+        Console.WriteLine("  props  List or edit project properties.");
     }
 
     private static int RunInfo(string[] args)
@@ -581,6 +586,58 @@ internal static class Program
         return SetStartupProjects(selectors);
     }
 
+    private static int RunProps(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.Error.WriteLine("Usage: vx props list !projectPattern | vx props set [!projectPattern]");
+            return 1;
+        }
+
+        var subCommand = args[0].Trim();
+        if (string.Equals(subCommand, "list", StringComparison.OrdinalIgnoreCase))
+        {
+            return RunPropsList(args.Skip(1).ToArray());
+        }
+
+        if (string.Equals(subCommand, "set", StringComparison.OrdinalIgnoreCase))
+        {
+            return RunPropsSet(args.Skip(1).ToArray());
+        }
+
+        Console.Error.WriteLine("Usage: vx props list !projectPattern | vx props set [!projectPattern]");
+        return 1;
+    }
+
+    private static int RunPropsList(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.Error.WriteLine("Usage: vx props list !projectPattern");
+            return 1;
+        }
+
+        var selector = NormalizeProjectSelector(string.Join(" ", args));
+        if (string.IsNullOrWhiteSpace(selector))
+        {
+            Console.Error.WriteLine("Usage: vx props list !projectPattern");
+            return 1;
+        }
+
+        return ListProjectProperties(selector);
+    }
+
+    private static int RunPropsSet(string[] args)
+    {
+        string? selector = null;
+        if (args.Length > 0)
+        {
+            selector = NormalizeProjectSelector(string.Join(" ", args));
+        }
+
+        return RunPropertyWizard(selector);
+    }
+
     private static string NormalizeProjectSelector(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
@@ -594,7 +651,550 @@ internal static class Program
             selector = selector.Substring(1).Trim();
         }
 
+        if (selector.EndsWith("!", StringComparison.Ordinal))
+        {
+            selector = selector.TrimEnd('!').Trim();
+        }
+
         return selector;
+    }
+
+    private static int ListProjectProperties(string selector)
+    {
+        var instances = VsRot.GetRunningDteInstances();
+        try
+        {
+            OleMessageFilter.Register();
+            if (instances.Count == 0)
+            {
+                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
+                return 1;
+            }
+
+            var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
+            if (target.Dte == null)
+            {
+                Console.Error.WriteLine("Failed to access running Visual Studio instance.");
+                return 1;
+            }
+
+            dynamic dte = target.Dte;
+            var solution = TryGetValue(() => (dynamic)dte.Solution);
+            if (solution == null || !TryGetValue(() => (bool)solution.IsOpen, false))
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            var project = FindProjectBySelector(solution, selector);
+            if (project == null)
+            {
+                Console.Error.WriteLine($"Project not found: {selector}");
+                return 1;
+            }
+
+            var pages = GetProjectPropertyPages(project);
+            if (pages.Count == 0)
+            {
+                Console.Error.WriteLine("No project properties found.");
+                return 1;
+            }
+
+            foreach (var page in pages)
+            {
+                Console.WriteLine($"*{page.Name}:");
+                foreach (var item in page.Items)
+                {
+                    var value = SafeFormatPropertyValue(item.Property);
+                    Console.WriteLine($"-{item.Name}: {value}");
+                }
+            }
+
+            return 0;
+        }
+        catch (COMException ex)
+        {
+            Console.Error.WriteLine($"Visual Studio automation error: {ex.Message}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            return 1;
+        }
+        finally
+        {
+            OleMessageFilter.Revoke();
+            VsRot.ReleaseInstances(instances);
+        }
+    }
+
+    private static int RunPropertyWizard(string? selector)
+    {
+        var instances = VsRot.GetRunningDteInstances();
+        try
+        {
+            OleMessageFilter.Register();
+            if (instances.Count == 0)
+            {
+                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
+                return 1;
+            }
+
+            var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
+            if (target.Dte == null)
+            {
+                Console.Error.WriteLine("Failed to access running Visual Studio instance.");
+                return 1;
+            }
+
+            dynamic dte = target.Dte;
+            var solution = TryGetValue(() => (dynamic)dte.Solution);
+            if (solution == null || !TryGetValue(() => (bool)solution.IsOpen, false))
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            var project = string.IsNullOrWhiteSpace(selector)
+                ? SelectProjectInteractively(solution)
+                : FindProjectBySelector(solution, selector);
+
+            if (project == null)
+            {
+                Console.Error.WriteLine(string.IsNullOrWhiteSpace(selector)
+                    ? "No project selected."
+                    : $"Project not found: {selector}");
+                return 1;
+            }
+
+            return RunPropertyWizardForProject(project);
+        }
+        catch (COMException ex)
+        {
+            Console.Error.WriteLine($"Visual Studio automation error: {ex.Message}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            return 1;
+        }
+        finally
+        {
+            OleMessageFilter.Revoke();
+            VsRot.ReleaseInstances(instances);
+        }
+    }
+
+    private static dynamic? SelectProjectInteractively(dynamic solution)
+    {
+        var projectCollection = TryGetValue(() => (object?)solution.Projects);
+        var projects = EnumerateProjects(projectCollection)
+            .Select(project => new ProjectEntry(project,
+                TryGetValue(() => (string?)project.Name) ?? "(unknown)",
+                TryGetValue(() => (string?)project.UniqueName)))
+            .OrderBy(p => p.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (projects.Count == 0)
+        {
+            Console.Error.WriteLine("No projects found in the active solution.");
+            return null;
+        }
+
+        while (true)
+        {
+            Console.WriteLine("*select a project:");
+            for (var i = 0; i < projects.Count; i++)
+            {
+                Console.WriteLine($"{i + 1}. {projects[i].DisplayName}");
+            }
+
+            Console.Write("Select project (q to quit): ");
+            var input = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                continue;
+            }
+
+            if (IsQuit(input))
+            {
+                return null;
+            }
+
+            if (int.TryParse(input, out var index) && index > 0 && index <= projects.Count)
+            {
+                return projects[index - 1].Project;
+            }
+
+            Console.WriteLine("Invalid selection.");
+        }
+    }
+
+    private static int RunPropertyWizardForProject(dynamic project)
+    {
+        var pages = GetProjectPropertyPages(project);
+        if (pages.Count == 0)
+        {
+            Console.WriteLine("No project properties found.");
+            return 1;
+        }
+
+        while (true)
+        {
+            Console.WriteLine("*select a project property page:");
+            for (var i = 0; i < pages.Count; i++)
+            {
+                Console.WriteLine($"{i + 1}. {pages[i].Name}");
+            }
+
+            Console.Write("Select page (b to go back, q to quit): ");
+            var input = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                continue;
+            }
+
+            if (IsQuit(input))
+            {
+                return 0;
+            }
+
+            if (IsBack(input))
+            {
+                return 0;
+            }
+
+            if (!int.TryParse(input, out var pageIndex) || pageIndex < 1 || pageIndex > pages.Count)
+            {
+                Console.WriteLine("Invalid selection.");
+                continue;
+            }
+
+            var page = pages[pageIndex - 1];
+            if (RunPropertyWizardForPage(page) == 0)
+            {
+                continue;
+            }
+        }
+    }
+
+    private static int RunPropertyWizardForPage(PropertyPage page)
+    {
+        var filter = string.Empty;
+        while (true)
+        {
+            var items = string.IsNullOrWhiteSpace(filter)
+                ? page.Items
+                : page.Items.Where(p => p.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            Console.WriteLine($"*select a property ({page.Name}):");
+            if (!string.IsNullOrWhiteSpace(filter))
+            {
+                Console.WriteLine($"  filter: {filter}");
+            }
+
+            if (items.Count == 0)
+            {
+                Console.WriteLine("  (no properties match the filter)");
+            }
+            else
+            {
+                for (var i = 0; i < items.Count; i++)
+                {
+                    var value = SafeFormatPropertyValue(items[i].Property);
+                    Console.WriteLine($"{i + 1}. {items[i].Name} = {value}");
+                }
+            }
+
+            Console.Write("Select property (/text to filter, * to clear, b to go back, q to quit): ");
+            var input = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                continue;
+            }
+
+            if (IsQuit(input))
+            {
+                return 0;
+            }
+
+            if (IsBack(input))
+            {
+                return 1;
+            }
+
+            if (input == "*")
+            {
+                filter = string.Empty;
+                continue;
+            }
+
+            if (input.StartsWith("/", StringComparison.Ordinal))
+            {
+                filter = input.Substring(1).Trim();
+                continue;
+            }
+
+            if (!int.TryParse(input, out var propIndex) || propIndex < 1 || propIndex > items.Count)
+            {
+                Console.WriteLine("Invalid selection.");
+                continue;
+            }
+
+            var item = items[propIndex - 1];
+            UpdatePropertyValue(item);
+        }
+    }
+
+    private static void UpdatePropertyValue(PropertyEntry entry)
+    {
+        var currentValue = (object?)TryGetValue(() => entry.Property.Value);
+        var formattedCurrent = FormatPropertyValue(currentValue);
+
+        var isReadOnly = TryGetValue(() => (bool)entry.Property.IsReadOnly, false)
+            || TryGetValue(() => (bool)entry.Property.ReadOnly, false);
+
+        if (isReadOnly)
+        {
+            Console.WriteLine($"Property '{entry.Name}' is read-only.");
+            return;
+        }
+
+        Console.WriteLine($"*update {entry.Name} value:");
+        Console.Write($"-enter new value <{formattedCurrent}>: ");
+        var input = Console.ReadLine();
+        if (input == null)
+        {
+            return;
+        }
+
+        if (IsQuit(input))
+        {
+            Environment.Exit(0);
+        }
+
+        if (IsBack(input))
+        {
+            return;
+        }
+
+        var newValue = input.Trim();
+        if (string.IsNullOrEmpty(newValue))
+        {
+            Console.WriteLine("Value unchanged.");
+            return;
+        }
+
+        if (string.Equals(newValue, formattedCurrent, StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("Value unchanged.");
+            return;
+        }
+
+        if (!TryConvertPropertyValue(newValue, currentValue, out object? converted, out string hint))
+        {
+            Console.WriteLine($"Invalid value. {hint}");
+            return;
+        }
+
+        try
+        {
+            entry.Property.Value = converted;
+            Console.WriteLine("Property updated successfully.");
+        }
+        catch (COMException ex)
+        {
+            Console.WriteLine($"Failed to update property: {ex.Message}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Failed to update property: {ex.Message}");
+        }
+    }
+
+    private static bool TryConvertPropertyValue(string input, object? currentValue, out object? converted, out string hint)
+    {
+        hint = string.Empty;
+        converted = input;
+
+        if (currentValue == null)
+        {
+            return true;
+        }
+
+        var type = currentValue.GetType();
+        if (type == typeof(string))
+        {
+            return true;
+        }
+
+        if (type == typeof(bool))
+        {
+            if (TryParseBool(input, out var boolValue))
+            {
+                converted = boolValue;
+                return true;
+            }
+
+            hint = "Expected true/false.";
+            return false;
+        }
+
+        if (type.IsEnum)
+        {
+            try
+            {
+                converted = Enum.Parse(type, input, true);
+                return true;
+            }
+            catch
+            {
+                hint = $"Expected one of: {string.Join(", ", Enum.GetNames(type))}";
+                return false;
+            }
+        }
+
+        try
+        {
+            converted = Convert.ChangeType(input, type);
+            return true;
+        }
+        catch
+        {
+            hint = $"Expected {type.Name} value.";
+            return false;
+        }
+    }
+
+    private static bool TryParseBool(string input, out bool value)
+    {
+        var normalized = input.Trim().ToLowerInvariant();
+        switch (normalized)
+        {
+            case "true":
+            case "t":
+            case "yes":
+            case "y":
+            case "1":
+                value = true;
+                return true;
+            case "false":
+            case "f":
+            case "no":
+            case "n":
+            case "0":
+                value = false;
+                return true;
+            default:
+                value = false;
+                return false;
+        }
+    }
+
+    private static bool IsQuit(string input)
+    {
+        return string.Equals(input.Trim(), "q", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsBack(string input)
+    {
+        return string.Equals(input.Trim(), "b", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static List<PropertyPage> GetProjectPropertyPages(dynamic project)
+    {
+        var pages = new List<PropertyPage>();
+
+        var projectProps = TryGetValue(() => (dynamic)project.Properties);
+        AddPropertyPage(pages, "Project Properties", projectProps);
+
+        var configManager = TryGetValue(() => (dynamic)project.ConfigurationManager);
+        var configs = TryGetValue(() => (dynamic)configManager?.Configurations);
+        foreach (var config in EnumerateComCollection(configs))
+        {
+            var configName = TryGetValue(() => (string?)config.ConfigurationName) ?? "Configuration";
+            var platformName = TryGetValue(() => (string?)config.PlatformName);
+            var pageName = string.IsNullOrWhiteSpace(platformName)
+                ? $"Configuration: {configName}"
+                : $"Configuration: {configName}|{platformName}";
+
+            var configProps = TryGetValue(() => (dynamic)config.Properties);
+            AddPropertyPage(pages, pageName, configProps);
+        }
+
+        return pages;
+    }
+
+    private static void AddPropertyPage(List<PropertyPage> pages, string name, dynamic properties)
+    {
+        if (properties == null)
+        {
+            return;
+        }
+
+        var items = new List<PropertyEntry>();
+        foreach (var prop in EnumerateComCollection(properties))
+        {
+            if (prop == null)
+            {
+                continue;
+            }
+
+            var propName = TryGetValue(() => (string?)prop.Name);
+            if (string.IsNullOrWhiteSpace(propName))
+            {
+                continue;
+            }
+
+            items.Add(new PropertyEntry(propName, prop));
+        }
+
+        if (items.Count == 0)
+        {
+            return;
+        }
+
+        pages.Add(new PropertyPage(name, items));
+    }
+
+    private static string SafeFormatPropertyValue(dynamic property)
+    {
+        try
+        {
+            var value = property.Value;
+            return FormatPropertyValue(value);
+        }
+        catch (COMException ex)
+        {
+            return $"<unavailable: {ex.Message}>";
+        }
+        catch (Exception ex)
+        {
+            return $"<unavailable: {ex.Message}>";
+        }
+    }
+
+    private static string FormatPropertyValue(object? value)
+    {
+        if (value == null)
+        {
+            return "(null)";
+        }
+
+        if (value is Array array)
+        {
+            var parts = new List<string>();
+            foreach (var item in array)
+            {
+                parts.Add(item?.ToString() ?? "(null)");
+            }
+
+            return string.Join(", ", parts);
+        }
+
+        return value.ToString() ?? "(null)";
     }
 
     private static int RunProjectBuildCommand(string[] args)
@@ -1672,6 +2272,44 @@ internal static class Program
 
             Console.WriteLine($"  Active document: {instance.ActiveDocument ?? "none"}");
         }
+    }
+
+    private sealed class PropertyPage
+    {
+        public PropertyPage(string name, List<PropertyEntry> items)
+        {
+            Name = name;
+            Items = items;
+        }
+
+        public string Name { get; }
+        public List<PropertyEntry> Items { get; }
+    }
+
+    private sealed class PropertyEntry
+    {
+        public PropertyEntry(string name, dynamic property)
+        {
+            Name = name;
+            Property = property;
+        }
+
+        public string Name { get; }
+        public dynamic Property { get; }
+    }
+
+    private sealed class ProjectEntry
+    {
+        public ProjectEntry(dynamic project, string displayName, string? uniqueName)
+        {
+            Project = project;
+            DisplayName = displayName;
+            UniqueName = uniqueName;
+        }
+
+        public dynamic Project { get; }
+        public string DisplayName { get; }
+        public string? UniqueName { get; }
     }
 }
 
