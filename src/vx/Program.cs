@@ -1,0 +1,707 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text.Json;
+
+internal static class Program
+{
+    [STAThread]
+    private static int Main(string[] args)
+    {
+        if (args.Length == 0 || IsHelp(args[0]))
+        {
+            PrintHelp();
+            return 0;
+        }
+
+        var command = args[0].ToLowerInvariant();
+        switch (command)
+        {
+            case "info":
+                return RunInfo(args.Skip(1).ToArray());
+            default:
+                Console.Error.WriteLine($"Unknown command: {args[0]}");
+                PrintHelp();
+                return 1;
+        }
+    }
+
+    private static bool IsHelp(string arg)
+    {
+        if (string.IsNullOrWhiteSpace(arg))
+        {
+            return true;
+        }
+
+        return arg is "-h" or "--help" or "help" or "/?";
+    }
+
+    private static void PrintHelp()
+    {
+        Console.WriteLine("vx - Visual Studio 2022 local CLI");
+        Console.WriteLine();
+        Console.WriteLine("Usage:");
+        Console.WriteLine("  vx info [--all] [--instance N] [--json]");
+        Console.WriteLine();
+        Console.WriteLine("Commands:");
+        Console.WriteLine("  info   Show details about running VS2022 instances.");
+    }
+
+    private static int RunInfo(string[] args)
+    {
+        var options = InfoOptions.Parse(args);
+        var instances = VsRot.GetRunningDteInstances();
+
+        if (instances.Count == 0)
+        {
+            if (options.Json)
+            {
+                var empty = new VxInfoSnapshot { InstanceCount = 0 };
+                WriteJson(empty);
+            }
+            else
+            {
+                Console.WriteLine("VS2022 running: no");
+            }
+
+            return 0;
+        }
+
+        var activeIndex = VsSelector.GetActiveIndex(instances);
+        if (activeIndex < 0)
+        {
+            activeIndex = 0;
+        }
+
+        if (options.InstanceIndex.HasValue && !options.All)
+        {
+            if (options.InstanceIndex.Value < 0 || options.InstanceIndex.Value >= instances.Count)
+            {
+                Console.Error.WriteLine($"Instance index {options.InstanceIndex.Value} is out of range.");
+                VsRot.ReleaseInstances(instances);
+                return 1;
+            }
+        }
+
+        var snapshots = new List<VsInstanceSnapshot>();
+        for (var i = 0; i < instances.Count; i++)
+        {
+            if (options.All)
+            {
+                snapshots.Add(SnapshotBuilder.Build(instances[i], i, i == activeIndex));
+                continue;
+            }
+
+            if (options.InstanceIndex.HasValue)
+            {
+                if (options.InstanceIndex.Value == i)
+                {
+                    snapshots.Add(SnapshotBuilder.Build(instances[i], i, i == activeIndex));
+                }
+
+                continue;
+            }
+
+            if (i == activeIndex)
+            {
+                snapshots.Add(SnapshotBuilder.Build(instances[i], i, true));
+            }
+        }
+
+        var info = new VxInfoSnapshot
+        {
+            InstanceCount = instances.Count,
+            Instances = snapshots
+        };
+
+        if (options.Json)
+        {
+            WriteJson(info);
+        }
+        else
+        {
+            PrintInfoText(info, activeIndex);
+        }
+
+        VsRot.ReleaseInstances(instances);
+        return 0;
+    }
+
+    private static void WriteJson(VxInfoSnapshot info)
+    {
+        var options = new JsonSerializerOptions { WriteIndented = true };
+        Console.WriteLine(JsonSerializer.Serialize(info, options));
+    }
+
+    private static void PrintInfoText(VxInfoSnapshot info, int activeIndex)
+    {
+        Console.WriteLine($"VS2022 running: yes ({info.InstanceCount} instance{(info.InstanceCount == 1 ? "" : "s")})");
+        if (info.InstanceCount > 1)
+        {
+            Console.WriteLine($"Active instance index: {activeIndex}");
+        }
+
+        foreach (var instance in info.Instances)
+        {
+            Console.WriteLine($"Instance {instance.Index}{(instance.IsActive ? " (active)" : string.Empty)}");
+            Console.WriteLine($"  PID: {instance.ProcessId?.ToString() ?? "unknown"}");
+            Console.WriteLine($"  Version: {instance.Version ?? "unknown"}");
+            Console.WriteLine($"  Edition: {instance.Edition ?? "unknown"}");
+            Console.WriteLine($"  Moniker: {instance.Moniker ?? "unknown"}");
+
+            if (instance.Solution != null && instance.Solution.IsOpen)
+            {
+                var solution = instance.Solution;
+                var name = solution.Name;
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    name = solution.FullName;
+                }
+
+                Console.WriteLine($"  Solution: {name ?? "none"}");
+                if (!string.IsNullOrWhiteSpace(solution.FullName))
+                {
+                    Console.WriteLine($"  Solution path: {solution.FullName}");
+                }
+
+                if (!string.IsNullOrWhiteSpace(solution.ActiveConfiguration))
+                {
+                    Console.WriteLine($"  Active configuration: {solution.ActiveConfiguration}");
+                }
+
+                if (!string.IsNullOrWhiteSpace(solution.ActivePlatform))
+                {
+                    Console.WriteLine($"  Active platform: {solution.ActivePlatform}");
+                }
+
+                Console.WriteLine($"  Projects ({instance.Projects.Count}):");
+                foreach (var project in instance.Projects)
+                {
+                    var kindLabel = project.KindName ?? project.Kind ?? "unknown";
+                    var line = $"    - {project.Name ?? "unknown"} [{kindLabel}]";
+                    if (!string.IsNullOrWhiteSpace(project.FullName))
+                    {
+                        line += $" - {project.FullName}";
+                    }
+
+                    Console.WriteLine(line);
+                }
+            }
+
+            Console.WriteLine($"  Open documents ({instance.Documents.Count}):");
+            foreach (var document in instance.Documents)
+            {
+                var name = document.Name ?? "unknown";
+                var line = $"    - {name}";
+                if (!string.IsNullOrWhiteSpace(document.FullName))
+                {
+                    line += $" - {document.FullName}";
+                }
+
+                Console.WriteLine(line);
+            }
+
+            Console.WriteLine($"  Active document: {instance.ActiveDocument ?? "none"}");
+        }
+    }
+}
+
+internal sealed class InfoOptions
+{
+    public bool All { get; set; }
+    public bool Json { get; set; }
+    public int? InstanceIndex { get; set; }
+
+    public static InfoOptions Parse(string[] args)
+    {
+        var options = new InfoOptions();
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var arg = args[i];
+            if (string.Equals(arg, "--all", StringComparison.OrdinalIgnoreCase))
+            {
+                options.All = true;
+                continue;
+            }
+
+            if (string.Equals(arg, "--json", StringComparison.OrdinalIgnoreCase))
+            {
+                options.Json = true;
+                continue;
+            }
+
+            if (string.Equals(arg, "--instance", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(arg, "-i", StringComparison.OrdinalIgnoreCase))
+            {
+                if (i + 1 < args.Length && int.TryParse(args[i + 1], out var index))
+                {
+                    options.InstanceIndex = index;
+                    i++;
+                }
+            }
+        }
+
+        return options;
+    }
+}
+
+internal sealed class VxInfoSnapshot
+{
+    public int InstanceCount { get; set; }
+    public List<VsInstanceSnapshot> Instances { get; set; } = new();
+}
+
+internal sealed class VsInstanceSnapshot
+{
+    public int Index { get; set; }
+    public bool IsActive { get; set; }
+    public string? Moniker { get; set; }
+    public int? ProcessId { get; set; }
+    public string? Version { get; set; }
+    public string? Edition { get; set; }
+    public SolutionSnapshot? Solution { get; set; }
+    public List<ProjectSnapshot> Projects { get; set; } = new();
+    public List<DocumentSnapshot> Documents { get; set; } = new();
+    public string? ActiveDocument { get; set; }
+}
+
+internal sealed class SolutionSnapshot
+{
+    public bool IsOpen { get; set; }
+    public string? Name { get; set; }
+    public string? FullName { get; set; }
+    public string? ActiveConfiguration { get; set; }
+    public string? ActivePlatform { get; set; }
+}
+
+internal sealed class ProjectSnapshot
+{
+    public string? Name { get; set; }
+    public string? FullName { get; set; }
+    public string? Kind { get; set; }
+    public string? KindName { get; set; }
+}
+
+internal sealed class DocumentSnapshot
+{
+    public string? Name { get; set; }
+    public string? FullName { get; set; }
+    public string? Kind { get; set; }
+}
+
+internal static class SnapshotBuilder
+{
+    private const string SolutionFolderKind = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
+
+    private static readonly Dictionary<string, string> ProjectKindMap = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}"] = "C#",
+        ["{9A19103F-16F7-4668-BE54-9A1E7A4F7556}"] = "C# (SDK)",
+        ["{F184B08F-C81C-45F6-A57F-5ABD9991F28F}"] = "VB.NET",
+        ["{F2A71F9B-5D33-465A-A702-920D77279786}"] = "F#",
+        ["{BC8A1FFA-BEE3-4634-8014-F334798102B3}"] = "C++",
+        ["{E24C65DC-7377-472B-9ABA-BC803B73C61A}"] = "Web Site",
+        ["{349C5851-65DF-11DA-9384-00065B846F21}"] = "Web Application",
+        ["{D954291E-2A0B-460D-934E-DC6B0785DB48}"] = "Shared Project"
+    };
+
+    public static VsInstanceSnapshot Build(VsInstance instance, int index, bool isActive)
+    {
+        var snapshot = new VsInstanceSnapshot
+        {
+            Index = index,
+            IsActive = isActive,
+            Moniker = instance.Moniker,
+            ProcessId = instance.ProcessId
+        };
+
+        if (instance.Dte == null)
+        {
+            return snapshot;
+        }
+
+        dynamic dte = instance.Dte;
+        snapshot.Version = TryGet(() => (string?)dte.Version);
+        snapshot.Edition = TryGet(() => (string?)dte.Edition);
+
+        var solution = TryGet(() => (dynamic)dte.Solution);
+        snapshot.Solution = BuildSolutionSnapshot(solution);
+        snapshot.Projects = BuildProjectSnapshots(solution);
+        snapshot.Documents = BuildDocumentSnapshots(dte);
+
+        var activeDocument = TryGet(() => (dynamic)dte.ActiveDocument);
+        if (activeDocument != null)
+        {
+            snapshot.ActiveDocument = TryGet(() => (string?)activeDocument.FullName) ?? TryGet(() => (string?)activeDocument.Name);
+        }
+
+        return snapshot;
+    }
+
+    private static SolutionSnapshot? BuildSolutionSnapshot(dynamic solution)
+    {
+        if (solution == null)
+        {
+            return null;
+        }
+
+        var snapshot = new SolutionSnapshot
+        {
+            IsOpen = TryGet(() => (bool)solution.IsOpen, false),
+            Name = TryGet(() => (string?)solution.Name),
+            FullName = TryGet(() => (string?)solution.FullName)
+        };
+
+        var build = TryGet(() => (dynamic)solution.SolutionBuild);
+        if (build != null)
+        {
+            var activeConfig = TryGet(() => (dynamic)build.ActiveConfiguration);
+            if (activeConfig != null)
+            {
+                snapshot.ActiveConfiguration = TryGet(() => (string?)activeConfig.Name);
+                snapshot.ActivePlatform = TryGet(() => (string?)activeConfig.PlatformName);
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(snapshot.Name) && !string.IsNullOrWhiteSpace(snapshot.FullName))
+        {
+            snapshot.Name = snapshot.FullName;
+        }
+
+        return snapshot;
+    }
+
+    private static List<ProjectSnapshot> BuildProjectSnapshots(dynamic solution)
+    {
+        var list = new List<ProjectSnapshot>();
+        if (solution == null)
+        {
+            return list;
+        }
+
+        var projects = TryGet(() => (dynamic)solution.Projects);
+        foreach (var project in EnumerateProjects(projects))
+        {
+            if (project == null)
+            {
+                continue;
+            }
+
+            var kind = TryGet(() => (string?)project.Kind);
+            var snapshot = new ProjectSnapshot
+            {
+                Name = TryGet(() => (string?)project.Name),
+                FullName = TryGet(() => (string?)project.FullName),
+                Kind = kind,
+                KindName = ResolveProjectKind(kind)
+            };
+
+            list.Add(snapshot);
+        }
+
+        return list;
+    }
+
+    private static List<DocumentSnapshot> BuildDocumentSnapshots(dynamic dte)
+    {
+        var list = new List<DocumentSnapshot>();
+        if (dte == null)
+        {
+            return list;
+        }
+
+        var documents = TryGet(() => (dynamic)dte.Documents);
+        foreach (var document in EnumerateComCollection(documents))
+        {
+            if (document == null)
+            {
+                continue;
+            }
+
+            list.Add(new DocumentSnapshot
+            {
+                Name = TryGet(() => (string?)document.Name),
+                FullName = TryGet(() => (string?)document.FullName),
+                Kind = TryGet(() => (string?)document.Kind)
+            });
+        }
+
+        return list;
+    }
+
+    private static IEnumerable<dynamic> EnumerateProjects(dynamic projects)
+    {
+        foreach (var project in EnumerateComCollection(projects))
+        {
+            foreach (var nested in EnumerateProjectNode(project))
+            {
+                yield return nested;
+            }
+        }
+    }
+
+    private static IEnumerable<dynamic> EnumerateProjectNode(dynamic project)
+    {
+        if (project == null)
+        {
+            yield break;
+        }
+
+        var kind = TryGet(() => (string?)project.Kind);
+        if (string.Equals(kind, SolutionFolderKind, StringComparison.OrdinalIgnoreCase))
+        {
+            var items = TryGet(() => (dynamic)project.ProjectItems);
+            foreach (var item in EnumerateComCollection(items))
+            {
+                var subProject = TryGet(() => (dynamic)item.SubProject);
+                foreach (var nested in EnumerateProjectNode(subProject))
+                {
+                    yield return nested;
+                }
+            }
+        }
+        else
+        {
+            yield return project;
+        }
+    }
+
+    private static string? ResolveProjectKind(string? kind)
+    {
+        if (string.IsNullOrWhiteSpace(kind))
+        {
+            return null;
+        }
+
+        if (ProjectKindMap.TryGetValue(kind, out var name))
+        {
+            return name;
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<dynamic> EnumerateComCollection(dynamic collection)
+    {
+        if (collection == null)
+        {
+            yield break;
+        }
+
+        if (collection is IEnumerable enumerable)
+        {
+            foreach (var item in enumerable)
+            {
+                yield return item;
+            }
+
+            yield break;
+        }
+
+        int count;
+        try
+        {
+            count = collection.Count;
+        }
+        catch
+        {
+            yield break;
+        }
+
+        for (var i = 1; i <= count; i++)
+        {
+            object? item = null;
+            try
+            {
+                item = collection.Item(i);
+            }
+            catch
+            {
+                // Skip invalid items.
+            }
+
+            if (item != null)
+            {
+                yield return item;
+            }
+        }
+    }
+
+    private static T? TryGet<T>(Func<T> action, T? fallback = default)
+    {
+        try
+        {
+            return action();
+        }
+        catch (COMException)
+        {
+            return fallback;
+        }
+        catch (InvalidCastException)
+        {
+            return fallback;
+        }
+        catch
+        {
+            return fallback;
+        }
+    }
+}
+
+internal sealed class VsInstance
+{
+    public string? Moniker { get; set; }
+    public object? Dte { get; set; }
+    public int? ProcessId { get; set; }
+}
+
+internal static class VsSelector
+{
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    public static int GetActiveIndex(List<VsInstance> instances)
+    {
+        var foreground = GetForegroundWindow();
+        if (foreground == IntPtr.Zero)
+        {
+            return -1;
+        }
+
+        for (var i = 0; i < instances.Count; i++)
+        {
+            var instance = instances[i];
+            if (instance.Dte == null)
+            {
+                continue;
+            }
+
+            var dte = instance.Dte;
+            var hwnd = TryGetWindowHandle(dte);
+            if (hwnd.HasValue && new IntPtr(hwnd.Value) == foreground)
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static int? TryGetWindowHandle(object? dte)
+    {
+        if (dte == null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return (int?)((dynamic)dte).MainWindow.HWnd;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+
+internal static class VsRot
+{
+    [DllImport("ole32.dll")]
+    private static extern int GetRunningObjectTable(int reserved, out IRunningObjectTable prot);
+
+    [DllImport("ole32.dll")]
+    private static extern int CreateBindCtx(int reserved, out IBindCtx ppbc);
+
+    public static List<VsInstance> GetRunningDteInstances()
+    {
+        var list = new List<VsInstance>();
+        if (GetRunningObjectTable(0, out var rot) != 0 || rot == null)
+        {
+            return list;
+        }
+
+        rot.EnumRunning(out var enumMoniker);
+        enumMoniker.Reset();
+        var fetched = new IMoniker[1];
+
+        while (enumMoniker.Next(1, fetched, IntPtr.Zero) == 0)
+        {
+            var moniker = fetched[0];
+            if (moniker == null)
+            {
+                continue;
+            }
+
+            if (CreateBindCtx(0, out var bindCtx) != 0 || bindCtx == null)
+            {
+                continue;
+            }
+
+            moniker.GetDisplayName(bindCtx, null, out var displayName);
+            if (string.IsNullOrWhiteSpace(displayName) || !displayName.StartsWith("!VisualStudio.DTE.17.0", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            try
+            {
+                rot.GetObject(moniker, out var comObject);
+                if (comObject == null)
+                {
+                    continue;
+                }
+
+                list.Add(new VsInstance
+                {
+                    Moniker = displayName,
+                    Dte = comObject,
+                    ProcessId = ParsePid(displayName)
+                });
+            }
+            catch
+            {
+                // Skip ROT entries we cannot access.
+            }
+        }
+
+        return list;
+    }
+
+    public static void ReleaseInstances(IEnumerable<VsInstance> instances)
+    {
+        foreach (var instance in instances)
+        {
+            if (instance.Dte != null && Marshal.IsComObject(instance.Dte))
+            {
+                Marshal.FinalReleaseComObject(instance.Dte);
+            }
+        }
+    }
+
+    private static int? ParsePid(string? moniker)
+    {
+        if (string.IsNullOrWhiteSpace(moniker))
+        {
+            return null;
+        }
+
+        var index = moniker.LastIndexOf(':');
+        if (index < 0 || index + 1 >= moniker.Length)
+        {
+            return null;
+        }
+
+        var tail = moniker.Substring(index + 1);
+        if (int.TryParse(tail, out var pid))
+        {
+            return pid;
+        }
+
+        return null;
+    }
+}
