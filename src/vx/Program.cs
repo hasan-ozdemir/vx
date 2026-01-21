@@ -52,7 +52,7 @@ internal static class Program
         Console.WriteLine("  vx info [--all] [--instance N] [--json]");
         Console.WriteLine("  vx open solution <path>");
         Console.WriteLine("  vx view <filename>");
-        Console.WriteLine("  vx view @ProjectName:<filename>");
+        Console.WriteLine("  vx view !ProjectName:<filename>");
         Console.WriteLine();
         Console.WriteLine("Commands:");
         Console.WriteLine("  info   Show details about running VS2022 instances.");
@@ -204,7 +204,7 @@ internal static class Program
     {
         if (args.Length == 0)
         {
-            Console.Error.WriteLine("Usage: vx view <filename> | vx view @ProjectName:<filename>");
+            Console.Error.WriteLine("Usage: vx view <filename> | vx view !ProjectName:<filename>");
             return 1;
         }
 
@@ -217,12 +217,12 @@ internal static class Program
 
         string? projectName = null;
         var fileSpec = rawTarget;
-        if (rawTarget.StartsWith("@", StringComparison.Ordinal))
+        if (rawTarget.StartsWith("!", StringComparison.Ordinal))
         {
             var separator = rawTarget.IndexOf(':');
             if (separator <= 1 || separator == rawTarget.Length - 1)
             {
-                Console.Error.WriteLine("Usage: vx view @ProjectName:<filename>");
+                Console.Error.WriteLine("Usage: vx view !ProjectName:<filename>");
                 return 1;
             }
 
@@ -230,7 +230,7 @@ internal static class Program
             fileSpec = rawTarget.Substring(separator + 1).Trim();
             if (string.IsNullOrWhiteSpace(projectName) || string.IsNullOrWhiteSpace(fileSpec))
             {
-                Console.Error.WriteLine("Usage: vx view @ProjectName:<filename>");
+                Console.Error.WriteLine("Usage: vx view !ProjectName:<filename>");
                 return 1;
             }
         }

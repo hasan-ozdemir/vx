@@ -16,7 +16,7 @@ dotnet build VxRemoteControl.sln
 dotnet run --project src/vx -- info
 dotnet run --project src/vx -- open solution C:\path\to\MySolution.sln
 dotnet run --project src/vx -- view MainPage.xaml.cs
-dotnet run --project src/vx -- view @MyProject:MainPage.xaml.cs
+dotnet run --project src/vx -- view !MyProject:MainPage.xaml.cs
 ```
 
 Options:
@@ -36,5 +36,5 @@ Options:
 `vx open solution <path>` opens the solution in the active VS2022 instance (or starts a new instance if none are running).
 
 `vx view <filename>` opens the first matching file in the active solution.
-`vx view @ProjectName:<filename>` opens the file within a specific project.
+`vx view !ProjectName:<filename>` opens the file within a specific project.
 
