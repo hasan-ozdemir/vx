@@ -161,6 +161,7 @@ internal static class Program
         var instances = VsRot.GetRunningDteInstances();
         try
         {
+            OleMessageFilter.Register();
             if (instances.Count > 0)
             {
                 var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
@@ -189,6 +190,7 @@ internal static class Program
         }
         finally
         {
+            OleMessageFilter.Revoke();
             VsRot.ReleaseInstances(instances);
         }
     }
@@ -673,6 +675,9 @@ internal static class VsSelector
     [DllImport("user32.dll")]
     private static extern IntPtr GetForegroundWindow();
 
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
     public static int GetActiveIndex(List<VsInstance> instances)
     {
         var foreground = GetForegroundWindow();
@@ -681,17 +686,21 @@ internal static class VsSelector
             return -1;
         }
 
+        GetWindowThreadProcessId(foreground, out var foregroundPid);
+        if (foregroundPid == 0)
+        {
+            return -1;
+        }
+
         for (var i = 0; i < instances.Count; i++)
         {
             var instance = instances[i];
-            if (instance.Dte == null)
+            if (!instance.ProcessId.HasValue)
             {
                 continue;
             }
 
-            var dte = instance.Dte;
-            var hwnd = TryGetWindowHandle(dte);
-            if (hwnd.HasValue && new IntPtr(hwnd.Value) == foreground)
+            if (instance.ProcessId.Value == (int)foregroundPid)
             {
                 return i;
             }
@@ -714,23 +723,6 @@ internal static class VsSelector
         }
 
         return instances[0];
-    }
-
-    private static int? TryGetWindowHandle(object? dte)
-    {
-        if (dte == null)
-        {
-            return null;
-        }
-
-        try
-        {
-            return (int?)((dynamic)dte).MainWindow.HWnd;
-        }
-        catch
-        {
-            return null;
-        }
     }
 }
 
@@ -828,5 +820,59 @@ internal static class VsRot
         }
 
         return null;
+    }
+}
+
+[ComImport]
+[Guid("00000016-0000-0000-C000-000000000046")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface IOleMessageFilter
+{
+    int HandleInComingCall(int dwCallType, IntPtr hTaskCaller, int dwTickCount, IntPtr lpInterfaceInfo);
+    int RetryRejectedCall(IntPtr hTaskCallee, int dwTickCount, int dwRejectType);
+    int MessagePending(IntPtr hTaskCallee, int dwTickCount, int dwPendingType);
+}
+
+internal sealed class OleMessageFilter : IOleMessageFilter
+{
+    private const int ServerCallIshandled = 0;
+    private const int RetryLater = 2;
+    private const int PendingMsgWaitDefProcess = 2;
+
+    [DllImport("ole32.dll")]
+    private static extern int CoRegisterMessageFilter(IOleMessageFilter? newFilter, out IOleMessageFilter? oldFilter);
+
+    private OleMessageFilter()
+    {
+    }
+
+    public static void Register()
+    {
+        CoRegisterMessageFilter(new OleMessageFilter(), out _);
+    }
+
+    public static void Revoke()
+    {
+        CoRegisterMessageFilter(null, out _);
+    }
+
+    int IOleMessageFilter.HandleInComingCall(int dwCallType, IntPtr hTaskCaller, int dwTickCount, IntPtr lpInterfaceInfo)
+    {
+        return ServerCallIshandled;
+    }
+
+    int IOleMessageFilter.RetryRejectedCall(IntPtr hTaskCallee, int dwTickCount, int dwRejectType)
+    {
+        if (dwRejectType == RetryLater)
+        {
+            return 100;
+        }
+
+        return -1;
+    }
+
+    int IOleMessageFilter.MessagePending(IntPtr hTaskCallee, int dwTickCount, int dwPendingType)
+    {
+        return PendingMsgWaitDefProcess;
     }
 }
