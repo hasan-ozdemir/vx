@@ -17,6 +17,10 @@ dotnet run --project src/vx -- info
 dotnet run --project src/vx -- open solution C:\path\to\MySolution.sln
 dotnet run --project src/vx -- view MainPage.xaml.cs
 dotnet run --project src/vx -- view !MyProject:MainPage.xaml.cs
+dotnet run --project src/vx -- ls us
+dotnet run --project src/vx -- ls cl
+dotnet run --project src/vx -- ls ns
+dotnet run --project src/vx -- ls mt:MainPage
 ```
 
 Options:
@@ -37,4 +41,7 @@ Options:
 
 `vx view <filename>` opens the first matching file in the active solution.
 `vx view !ProjectName:<filename>` opens the file within a specific project.
+
+`vx ls us|cl|ns` lists using directives, class names, or namespaces from the active document.
+`vx ls mt:ClassName` lists methods under the specified class in the active document.
 

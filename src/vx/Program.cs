@@ -6,6 +6,9 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text.Json;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 
 internal static class Program
 {
@@ -27,6 +30,8 @@ internal static class Program
                 return RunOpen(args.Skip(1).ToArray());
             case "view":
                 return RunView(args.Skip(1).ToArray());
+            case "ls":
+                return RunList(args.Skip(1).ToArray());
             default:
                 Console.Error.WriteLine($"Unknown command: {args[0]}");
                 PrintHelp();
@@ -53,11 +58,13 @@ internal static class Program
         Console.WriteLine("  vx open solution <path>");
         Console.WriteLine("  vx view <filename>");
         Console.WriteLine("  vx view !ProjectName:<filename>");
+        Console.WriteLine("  vx ls us | cl | ns | mt:ClassName");
         Console.WriteLine();
         Console.WriteLine("Commands:");
         Console.WriteLine("  info   Show details about running VS2022 instances.");
         Console.WriteLine("  open   Open a solution in Visual Studio 2022.");
         Console.WriteLine("  view   Open a file in the active solution.");
+        Console.WriteLine("  ls     List items from the active document.");
     }
 
     private static int RunInfo(string[] args)
@@ -307,6 +314,134 @@ internal static class Program
         }
     }
 
+    private static int RunList(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.Error.WriteLine("Usage: vx ls us | cl | ns | mt:ClassName");
+            return 1;
+        }
+
+        var rawTarget = string.Join(" ", args).Trim();
+        if (string.IsNullOrWhiteSpace(rawTarget))
+        {
+            Console.Error.WriteLine("Usage: vx ls us | cl | ns | mt:ClassName");
+            return 1;
+        }
+
+        var query = rawTarget.Trim();
+        var mode = query;
+        string? className = null;
+        if (query.StartsWith("mt", StringComparison.OrdinalIgnoreCase))
+        {
+            var separator = query.IndexOf(':');
+            if (separator <= 1 || separator == query.Length - 1)
+            {
+                Console.Error.WriteLine("Usage: vx ls mt:ClassName");
+                return 1;
+            }
+
+            className = query.Substring(separator + 1).Trim().TrimEnd(':');
+            if (string.IsNullOrWhiteSpace(className))
+            {
+                Console.Error.WriteLine("Usage: vx ls mt:ClassName");
+                return 1;
+            }
+
+            mode = "mt";
+        }
+        else
+        {
+            mode = query.ToLowerInvariant();
+        }
+
+        if (mode != "us" && mode != "cl" && mode != "ns" && mode != "mt")
+        {
+            Console.Error.WriteLine("Usage: vx ls us | cl | ns | mt:ClassName");
+            return 1;
+        }
+
+        var instances = VsRot.GetRunningDteInstances();
+        try
+        {
+            OleMessageFilter.Register();
+            if (instances.Count == 0)
+            {
+                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
+                return 1;
+            }
+
+            var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
+            if (target.Dte == null)
+            {
+                Console.Error.WriteLine("Failed to access running Visual Studio instance.");
+                return 1;
+            }
+
+            dynamic dte = target.Dte;
+            var activeDoc = TryGetValue(() => (dynamic)dte.ActiveDocument);
+            if (activeDoc == null)
+            {
+                Console.Error.WriteLine("No active document is selected.");
+                return 1;
+            }
+
+            var text = GetActiveDocumentText(activeDoc);
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                Console.Error.WriteLine("Failed to read the active document.");
+                return 1;
+            }
+
+            SyntaxTree tree = CSharpSyntaxTree.ParseText(text);
+            var diagnostics = tree.GetDiagnostics().Where(d => d.Severity == DiagnosticSeverity.Error).ToList();
+            if (diagnostics.Count > 0)
+            {
+                Console.Error.WriteLine("Syntax errors found in the active document:");
+                foreach (var diagnostic in diagnostics)
+                {
+                    var span = diagnostic.Location.GetLineSpan();
+                    var line = span.StartLinePosition.Line + 1;
+                    var column = span.StartLinePosition.Character + 1;
+                    Console.Error.WriteLine($"  L{line}:C{column} {diagnostic.GetMessage()}");
+                }
+
+                return 1;
+            }
+
+            var root = tree.GetRoot();
+            switch (mode)
+            {
+                case "us":
+                    return PrintUsingList(root);
+                case "ns":
+                    return PrintNamespaceList(root);
+                case "cl":
+                    return PrintClassList(root);
+                case "mt":
+                    return PrintMethodList(root, className!);
+                default:
+                    Console.Error.WriteLine("Usage: vx ls us | cl | ns | mt:ClassName");
+                    return 1;
+            }
+        }
+        catch (COMException ex)
+        {
+            Console.Error.WriteLine($"Visual Studio automation error: {ex.Message}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            return 1;
+        }
+        finally
+        {
+            OleMessageFilter.Revoke();
+            VsRot.ReleaseInstances(instances);
+        }
+    }
+
     private static void OpenInExistingInstance(object dteObject, string solutionPath)
     {
         dynamic dte = dteObject;
@@ -351,6 +486,160 @@ internal static class Program
         {
             // Ignore activation failures.
         }
+    }
+
+    private static string? GetActiveDocumentText(dynamic activeDocument)
+    {
+        if (activeDocument == null)
+        {
+            return null;
+        }
+
+        var textDoc = TryGetValue(() => (dynamic)activeDocument.Object("TextDocument"));
+        if (textDoc == null)
+        {
+            return null;
+        }
+
+        var startPoint = TryGetValue(() => (dynamic)textDoc.StartPoint);
+        var endPoint = TryGetValue(() => (dynamic)textDoc.EndPoint);
+        var startObj = (object?)startPoint;
+        var endObj = (object?)endPoint;
+        if (startObj == null || endObj == null)
+        {
+            return null;
+        }
+
+        var editPoint = TryGetValue(() => ((dynamic)startObj).CreateEditPoint());
+        if (editPoint == null)
+        {
+            return null;
+        }
+
+        return TryGetValue(() => (string)((dynamic)editPoint).GetText(endObj));
+    }
+
+    private static int PrintUsingList(SyntaxNode root)
+    {
+        var usings = root.DescendantNodes().OfType<UsingDirectiveSyntax>()
+            .Select(u => u.ToString().Trim())
+            .Where(u => !string.IsNullOrWhiteSpace(u))
+            .ToList();
+
+        if (usings.Count == 0)
+        {
+            Console.Error.WriteLine("No using directives found.");
+            return 1;
+        }
+
+        foreach (var entry in usings)
+        {
+            Console.WriteLine(entry);
+        }
+
+        return 0;
+    }
+
+    private static int PrintNamespaceList(SyntaxNode root)
+    {
+        var namespaces = root.DescendantNodes().OfType<BaseNamespaceDeclarationSyntax>()
+            .Select(n => n.Name.ToString())
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (namespaces.Count == 0)
+        {
+            Console.Error.WriteLine("No namespace declarations found.");
+            return 1;
+        }
+
+        foreach (var entry in namespaces)
+        {
+            Console.WriteLine(entry);
+        }
+
+        return 0;
+    }
+
+    private static int PrintClassList(SyntaxNode root)
+    {
+        var classes = root.DescendantNodes().OfType<ClassDeclarationSyntax>()
+            .Select(GetFullTypeName)
+            .Where(n => !string.IsNullOrWhiteSpace(n))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        if (classes.Count == 0)
+        {
+            Console.Error.WriteLine("No class declarations found.");
+            return 1;
+        }
+
+        foreach (var entry in classes)
+        {
+            Console.WriteLine(entry);
+        }
+
+        return 0;
+    }
+
+    private static int PrintMethodList(SyntaxNode root, string className)
+    {
+        var classDecl = root.DescendantNodes().OfType<ClassDeclarationSyntax>()
+            .FirstOrDefault(c => string.Equals(c.Identifier.Text, className, StringComparison.OrdinalIgnoreCase));
+
+        if (classDecl == null)
+        {
+            Console.Error.WriteLine($"Class not found: {className}");
+            return 1;
+        }
+
+        var methods = classDecl.Members.OfType<MethodDeclarationSyntax>().ToList();
+        if (methods.Count == 0)
+        {
+            Console.Error.WriteLine($"No methods found in class {className}.");
+            return 1;
+        }
+
+        foreach (var method in methods)
+        {
+            var signature = method.Identifier.Text;
+            if (method.TypeParameterList != null)
+            {
+                signature += method.TypeParameterList.ToString();
+            }
+
+            signature += method.ParameterList.ToString();
+            var returnType = method.ReturnType.ToString();
+            Console.WriteLine($"{returnType} {signature}");
+        }
+
+        return 0;
+    }
+
+    private static string GetFullTypeName(ClassDeclarationSyntax classDecl)
+    {
+        var parts = new List<string>
+        {
+            classDecl.Identifier.Text
+        };
+
+        for (var parent = classDecl.Parent; parent != null; parent = parent.Parent)
+        {
+            switch (parent)
+            {
+                case ClassDeclarationSyntax parentClass:
+                    parts.Add(parentClass.Identifier.Text);
+                    break;
+                case BaseNamespaceDeclarationSyntax ns:
+                    parts.Add(ns.Name.ToString());
+                    break;
+            }
+        }
+
+        parts.Reverse();
+        return string.Join(".", parts);
     }
 
     private const string SolutionFolderKind = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
