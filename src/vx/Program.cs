@@ -388,7 +388,25 @@ internal static class Program
     private static string? FindFileInProject(dynamic project, string fileSpec)
     {
         var items = TryGetValue(() => (dynamic)project.ProjectItems);
-        return FindFileInProjectItems(items, fileSpec);
+        var path = FindFileInProjectItems(items, fileSpec);
+        if (!string.IsNullOrWhiteSpace(path))
+        {
+            return path;
+        }
+
+        var projectPath = TryGetValue(() => (string?)project.FullName);
+        if (string.IsNullOrWhiteSpace(projectPath))
+        {
+            return null;
+        }
+
+        var projectDir = Path.GetDirectoryName(projectPath);
+        if (string.IsNullOrWhiteSpace(projectDir))
+        {
+            return null;
+        }
+
+        return FindFileOnDisk(projectDir, fileSpec);
     }
 
     private static string? FindFileInProjectItems(dynamic items, string fileSpec)
@@ -473,6 +491,102 @@ internal static class Program
                 yield return nested;
             }
         }
+    }
+
+    private static string? FindFileOnDisk(string rootDirectory, string fileSpec)
+    {
+        if (string.IsNullOrWhiteSpace(rootDirectory) || string.IsNullOrWhiteSpace(fileSpec))
+        {
+            return null;
+        }
+
+        if (Path.IsPathRooted(fileSpec))
+        {
+            return File.Exists(fileSpec) ? Path.GetFullPath(fileSpec) : null;
+        }
+
+        var combined = Path.Combine(rootDirectory, fileSpec);
+        if (File.Exists(combined))
+        {
+            return Path.GetFullPath(combined);
+        }
+
+        var normalizedSpec = fileSpec.Replace('/', '\\');
+        var hasSubPath = normalizedSpec.Contains('\\');
+        var ignore = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "bin",
+            "obj",
+            ".vs",
+            ".git",
+            "node_modules",
+            "packages"
+        };
+
+        var stack = new Stack<string>();
+        stack.Push(rootDirectory);
+
+        while (stack.Count > 0)
+        {
+            var current = stack.Pop();
+            string currentName;
+            try
+            {
+                currentName = new DirectoryInfo(current).Name;
+            }
+            catch
+            {
+                continue;
+            }
+
+            if (ignore.Contains(currentName))
+            {
+                continue;
+            }
+
+            IEnumerable<string> directories;
+            try
+            {
+                directories = Directory.EnumerateDirectories(current);
+            }
+            catch
+            {
+                directories = Array.Empty<string>();
+            }
+
+            foreach (var dir in directories)
+            {
+                stack.Push(dir);
+            }
+
+            IEnumerable<string> files;
+            try
+            {
+                files = hasSubPath
+                    ? Directory.EnumerateFiles(current)
+                    : Directory.EnumerateFiles(current, normalizedSpec);
+            }
+            catch
+            {
+                continue;
+            }
+
+            foreach (var file in files)
+            {
+                if (hasSubPath)
+                {
+                    var normalizedFile = file.Replace('/', '\\');
+                    if (!normalizedFile.EndsWith(normalizedSpec, StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+                }
+
+                return file;
+            }
+        }
+
+        return null;
     }
 
     private static IEnumerable<dynamic> EnumerateComCollection(dynamic collection)
