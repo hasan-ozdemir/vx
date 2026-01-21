@@ -26,6 +26,7 @@ dotnet run --project src/vx -- rebuild
 dotnet run --project src/vx -- clean
 dotnet run --project src/vx -- build bot*
 dotnet run --project src/vx -- build !*ios
+dotnet run --project src/vx -- deploy !*ios
 dotnet run --project src/vx -- !BotyumApp:build
 dotnet run --project src/vx -- !BotyumApp:rebuild
 dotnet run --project src/vx -- !BotyumApp:clean
@@ -55,5 +56,6 @@ Options:
 `vx ls mt:ClassName` lists methods under the specified class in the active document.
 
 `vx build`, `vx rebuild`, and `vx clean` operate on the active solution. Add a project pattern to target the first match (wildcard `*` supported).
+`vx deploy !projectPattern` deploys the first matching project (wildcard `*` supported).
 `vx !ProjectName:build|rebuild|clean|deploy` runs the action for a specific project in the active solution (wildcard `*` supported in the project name).
 

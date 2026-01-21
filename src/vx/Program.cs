@@ -44,6 +44,8 @@ internal static class Program
                 return RunSolutionBuild("rebuild", args.Skip(1).ToArray());
             case "clean":
                 return RunSolutionBuild("clean", args.Skip(1).ToArray());
+            case "deploy":
+                return RunDeploy(args.Skip(1).ToArray());
             default:
                 Console.Error.WriteLine($"Unknown command: {args[0]}");
                 PrintHelp();
@@ -74,6 +76,7 @@ internal static class Program
         Console.WriteLine("  vx build [projectPattern]");
         Console.WriteLine("  vx rebuild [projectPattern]");
         Console.WriteLine("  vx clean [projectPattern]");
+        Console.WriteLine("  vx deploy !projectPattern");
         Console.WriteLine("  vx !ProjectName:build|rebuild|clean|deploy");
         Console.WriteLine();
         Console.WriteLine("Commands:");
@@ -84,6 +87,7 @@ internal static class Program
         Console.WriteLine("  build  Build the active solution or matching project.");
         Console.WriteLine("  rebuild Rebuild the active solution or matching project.");
         Console.WriteLine("  clean  Clean the active solution or matching project.");
+        Console.WriteLine("  deploy Deploy a matching project.");
     }
 
     private static int RunInfo(string[] args)
@@ -491,6 +495,29 @@ internal static class Program
         }
     }
 
+    private static int RunDeploy(string[] args)
+    {
+        if (args.Length != 1)
+        {
+            Console.Error.WriteLine("Usage: vx deploy !projectPattern");
+            return 1;
+        }
+
+        var selector = args[0].Trim();
+        if (selector.StartsWith("!", StringComparison.Ordinal))
+        {
+            selector = selector.Substring(1).Trim();
+        }
+
+        if (string.IsNullOrWhiteSpace(selector))
+        {
+            Console.Error.WriteLine("Usage: vx deploy !projectPattern");
+            return 1;
+        }
+
+        return ExecuteBuildAction("deploy", selector);
+    }
+
     private static int RunProjectBuildCommand(string[] args)
     {
         if (args.Length != 1)
@@ -573,6 +600,12 @@ internal static class Program
 
             if (string.IsNullOrWhiteSpace(projectName))
             {
+                if (string.Equals(action, "deploy", StringComparison.OrdinalIgnoreCase))
+                {
+                    Console.Error.WriteLine("Usage: vx deploy !projectPattern");
+                    return 1;
+                }
+
                 var result = ExecuteSolutionBuildAction(dte, build, action);
                 if (result == 0)
                 {
