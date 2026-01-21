@@ -21,6 +21,11 @@ internal static class Program
             return 0;
         }
 
+        if (args[0].StartsWith("!", StringComparison.Ordinal))
+        {
+            return RunProjectBuildCommand(args);
+        }
+
         var command = args[0].ToLowerInvariant();
         switch (command)
         {
@@ -32,6 +37,12 @@ internal static class Program
                 return RunView(args.Skip(1).ToArray());
             case "ls":
                 return RunList(args.Skip(1).ToArray());
+            case "build":
+                return RunSolutionBuild("build", args.Skip(1).ToArray());
+            case "rebuild":
+                return RunSolutionBuild("rebuild", args.Skip(1).ToArray());
+            case "clean":
+                return RunSolutionBuild("clean", args.Skip(1).ToArray());
             default:
                 Console.Error.WriteLine($"Unknown command: {args[0]}");
                 PrintHelp();
@@ -59,12 +70,17 @@ internal static class Program
         Console.WriteLine("  vx view <filename>");
         Console.WriteLine("  vx view !ProjectName:<filename>");
         Console.WriteLine("  vx ls us | cl | ns | mt:ClassName");
+        Console.WriteLine("  vx build | rebuild | clean");
+        Console.WriteLine("  vx !ProjectName:build|rebuild|clean|deploy");
         Console.WriteLine();
         Console.WriteLine("Commands:");
         Console.WriteLine("  info   Show details about running VS2022 instances.");
         Console.WriteLine("  open   Open a solution in Visual Studio 2022.");
         Console.WriteLine("  view   Open a file in the active solution.");
         Console.WriteLine("  ls     List items from the active document.");
+        Console.WriteLine("  build  Build the active solution.");
+        Console.WriteLine("  rebuild Rebuild the active solution.");
+        Console.WriteLine("  clean  Clean the active solution.");
     }
 
     private static int RunInfo(string[] args)
@@ -439,6 +455,275 @@ internal static class Program
         {
             OleMessageFilter.Revoke();
             VsRot.ReleaseInstances(instances);
+        }
+    }
+
+    private static int RunSolutionBuild(string action, string[] args)
+    {
+        if (args.Length > 0)
+        {
+            Console.Error.WriteLine("Usage: vx build | rebuild | clean");
+            return 1;
+        }
+
+        return ExecuteBuildAction(action, null);
+    }
+
+    private static int RunProjectBuildCommand(string[] args)
+    {
+        if (args.Length != 1)
+        {
+            Console.Error.WriteLine("Usage: vx !ProjectName:build|rebuild|clean|deploy");
+            return 1;
+        }
+
+        var token = args[0];
+        if (!token.StartsWith("!", StringComparison.Ordinal))
+        {
+            Console.Error.WriteLine("Usage: vx !ProjectName:build|rebuild|clean|deploy");
+            return 1;
+        }
+
+        var separator = token.IndexOf(':');
+        if (separator <= 1 || separator == token.Length - 1)
+        {
+            Console.Error.WriteLine("Usage: vx !ProjectName:build|rebuild|clean|deploy");
+            return 1;
+        }
+
+        var projectName = token.Substring(1, separator - 1).Trim();
+        var action = token.Substring(separator + 1).Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(projectName) || string.IsNullOrWhiteSpace(action))
+        {
+            Console.Error.WriteLine("Usage: vx !ProjectName:build|rebuild|clean|deploy");
+            return 1;
+        }
+
+        if (action is not ("build" or "rebuild" or "clean" or "deploy"))
+        {
+            Console.Error.WriteLine("Usage: vx !ProjectName:build|rebuild|clean|deploy");
+            return 1;
+        }
+
+        return ExecuteBuildAction(action, projectName);
+    }
+
+    private static int ExecuteBuildAction(string action, string? projectName)
+    {
+        var instances = VsRot.GetRunningDteInstances();
+        try
+        {
+            OleMessageFilter.Register();
+            if (instances.Count == 0)
+            {
+                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
+                return 1;
+            }
+
+            var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
+            if (target.Dte == null)
+            {
+                Console.Error.WriteLine("Failed to access running Visual Studio instance.");
+                return 1;
+            }
+
+            dynamic dte = target.Dte;
+            var solution = TryGetValue(() => (dynamic)dte.Solution);
+            if (solution == null)
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            var isOpen = TryGetValue(() => (bool)solution.IsOpen, false);
+            if (!isOpen)
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            var build = TryGetValue(() => (dynamic)solution.SolutionBuild);
+            if (build == null)
+            {
+                Console.Error.WriteLine("Solution build service is unavailable.");
+                return 1;
+            }
+
+            if (string.IsNullOrWhiteSpace(projectName))
+            {
+                return ExecuteSolutionBuildAction(dte, build, action);
+            }
+
+            var project = FindProjectByName(solution, projectName);
+            if (project == null)
+            {
+                Console.Error.WriteLine($"Project not found: {projectName}");
+                return 1;
+            }
+
+            var projectUniqueName = TryGetValue(() => (string?)project.UniqueName)
+                ?? TryGetValue(() => (string?)project.FullName)
+                ?? TryGetValue(() => (string?)project.Name);
+
+            if (string.IsNullOrWhiteSpace(projectUniqueName))
+            {
+                Console.Error.WriteLine("Project unique name is unavailable.");
+                return 1;
+            }
+
+            var configurationName = GetActiveSolutionConfiguration(build);
+            if (string.IsNullOrWhiteSpace(configurationName))
+            {
+                Console.Error.WriteLine("Active solution configuration is unavailable.");
+                return 1;
+            }
+
+            return ExecuteProjectBuildAction(build, action, configurationName, projectUniqueName, projectName);
+        }
+        catch (COMException ex)
+        {
+            Console.Error.WriteLine($"Visual Studio automation error: {ex.Message}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            return 1;
+        }
+        finally
+        {
+            OleMessageFilter.Revoke();
+            VsRot.ReleaseInstances(instances);
+        }
+    }
+
+    private static int ExecuteSolutionBuildAction(dynamic dte, dynamic build, string action)
+    {
+        string? error;
+        switch (action)
+        {
+            case "build":
+                if (!TryInvoke(() => build.Build(true), out error) &&
+                    !TryInvoke(() => dte.ExecuteCommand("Build.BuildSolution"), out error))
+                {
+                    Console.Error.WriteLine($"Build failed: {error}");
+                    return 1;
+                }
+
+                return 0;
+            case "rebuild":
+                if (!TryInvoke(() => build.Rebuild(true), out error) &&
+                    !TryInvoke(() => dte.ExecuteCommand("Build.RebuildSolution"), out error))
+                {
+                    Console.Error.WriteLine($"Rebuild failed: {error}");
+                    return 1;
+                }
+
+                return 0;
+            case "clean":
+                if (!TryInvoke(() => build.Clean(true), out error) &&
+                    !TryInvoke(() => dte.ExecuteCommand("Build.CleanSolution"), out error))
+                {
+                    Console.Error.WriteLine($"Clean failed: {error}");
+                    return 1;
+                }
+
+                return 0;
+            default:
+                Console.Error.WriteLine("Usage: vx build | rebuild | clean");
+                return 1;
+        }
+    }
+
+    private static int ExecuteProjectBuildAction(dynamic build, string action, string configurationName, string projectUniqueName, string projectName)
+    {
+        string? error;
+        switch (action)
+        {
+            case "build":
+                if (!TryInvoke(() => build.BuildProject(configurationName, projectUniqueName, true), out error))
+                {
+                    Console.Error.WriteLine($"Build failed for {projectName}: {error}");
+                    return 1;
+                }
+
+                return 0;
+            case "rebuild":
+                if (!TryInvoke(() => build.CleanProject(configurationName, projectUniqueName, true), out error))
+                {
+                    Console.Error.WriteLine($"Rebuild failed (clean) for {projectName}: {error}");
+                    return 1;
+                }
+
+                if (!TryInvoke(() => build.BuildProject(configurationName, projectUniqueName, true), out error))
+                {
+                    Console.Error.WriteLine($"Rebuild failed (build) for {projectName}: {error}");
+                    return 1;
+                }
+
+                return 0;
+            case "clean":
+                if (!TryInvoke(() => build.CleanProject(configurationName, projectUniqueName, true), out error))
+                {
+                    Console.Error.WriteLine($"Clean failed for {projectName}: {error}");
+                    return 1;
+                }
+
+                return 0;
+            case "deploy":
+                if (!TryInvoke(() => build.DeployProject(configurationName, projectUniqueName, true), out error))
+                {
+                    Console.Error.WriteLine($"Deploy failed for {projectName}: {error}");
+                    return 1;
+                }
+
+                return 0;
+            default:
+                Console.Error.WriteLine("Usage: vx !ProjectName:build|rebuild|clean|deploy");
+                return 1;
+        }
+    }
+
+    private static string? GetActiveSolutionConfiguration(dynamic build)
+    {
+        var activeConfig = TryGetValue(() => (dynamic)build.ActiveConfiguration);
+        if (activeConfig == null)
+        {
+            return null;
+        }
+
+        var name = TryGetValue(() => (string?)activeConfig.Name);
+        var platform = TryGetValue(() => (string?)activeConfig.PlatformName);
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return null;
+        }
+
+        if (!string.IsNullOrWhiteSpace(platform))
+        {
+            return $"{name}|{platform}";
+        }
+
+        return name;
+    }
+
+    private static bool TryInvoke(Action action, out string? error)
+    {
+        try
+        {
+            action();
+            error = null;
+            return true;
+        }
+        catch (COMException ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
         }
     }
 
