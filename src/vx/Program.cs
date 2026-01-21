@@ -46,6 +46,10 @@ internal static class Program
                 return RunSolutionBuild("clean", args.Skip(1).ToArray());
             case "deploy":
                 return RunDeploy(args.Skip(1).ToArray());
+            case "startup":
+                return RunStartup(args.Skip(1).ToArray());
+            case "startups":
+                return RunStartups(args.Skip(1).ToArray());
             default:
                 Console.Error.WriteLine($"Unknown command: {args[0]}");
                 PrintHelp();
@@ -77,6 +81,8 @@ internal static class Program
         Console.WriteLine("  vx rebuild [projectPattern]");
         Console.WriteLine("  vx clean [projectPattern]");
         Console.WriteLine("  vx deploy !projectPattern");
+        Console.WriteLine("  vx startup !projectPattern");
+        Console.WriteLine("  vx startups !pattern1;!pattern2");
         Console.WriteLine("  vx !ProjectName:build|rebuild|clean|deploy");
         Console.WriteLine();
         Console.WriteLine("Commands:");
@@ -88,6 +94,8 @@ internal static class Program
         Console.WriteLine("  rebuild Rebuild the active solution or matching project.");
         Console.WriteLine("  clean  Clean the active solution or matching project.");
         Console.WriteLine("  deploy Deploy a matching project.");
+        Console.WriteLine("  startup Set the startup project.");
+        Console.WriteLine("  startups Set multiple startup projects.");
     }
 
     private static int RunInfo(string[] args)
@@ -518,6 +526,69 @@ internal static class Program
         return ExecuteBuildAction("deploy", selector);
     }
 
+    private static int RunStartup(string[] args)
+    {
+        if (args.Length != 1)
+        {
+            Console.Error.WriteLine("Usage: vx startup !projectPattern");
+            return 1;
+        }
+
+        var selector = NormalizeProjectSelector(args[0]);
+        if (string.IsNullOrWhiteSpace(selector))
+        {
+            Console.Error.WriteLine("Usage: vx startup !projectPattern");
+            return 1;
+        }
+
+        return SetStartupProjects(new[] { selector });
+    }
+
+    private static int RunStartups(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.Error.WriteLine("Usage: vx startups !pattern1;!pattern2");
+            return 1;
+        }
+
+        var raw = string.Join(" ", args).Trim();
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            Console.Error.WriteLine("Usage: vx startups !pattern1;!pattern2");
+            return 1;
+        }
+
+        var selectors = raw.Split(';', StringSplitOptions.RemoveEmptyEntries)
+            .Select(s => NormalizeProjectSelector(s))
+            .Where(s => !string.IsNullOrWhiteSpace(s))
+            .ToList();
+
+        if (selectors.Count == 0)
+        {
+            Console.Error.WriteLine("Usage: vx startups !pattern1;!pattern2");
+            return 1;
+        }
+
+        return SetStartupProjects(selectors);
+    }
+
+    private static string NormalizeProjectSelector(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+        {
+            return string.Empty;
+        }
+
+        var selector = raw.Trim();
+        if (selector.StartsWith("!", StringComparison.Ordinal))
+        {
+            selector = selector.Substring(1).Trim();
+        }
+
+        return selector;
+    }
+
     private static int RunProjectBuildCommand(string[] args)
     {
         if (args.Length != 1)
@@ -647,6 +718,110 @@ internal static class Program
             }
 
             return projectResult;
+        }
+        catch (COMException ex)
+        {
+            Console.Error.WriteLine($"Visual Studio automation error: {ex.Message}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            return 1;
+        }
+        finally
+        {
+            OleMessageFilter.Revoke();
+            VsRot.ReleaseInstances(instances);
+        }
+    }
+
+    private static int SetStartupProjects(IReadOnlyList<string> selectors)
+    {
+        var instances = VsRot.GetRunningDteInstances();
+        try
+        {
+            OleMessageFilter.Register();
+            if (instances.Count == 0)
+            {
+                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
+                return 1;
+            }
+
+            var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
+            if (target.Dte == null)
+            {
+                Console.Error.WriteLine("Failed to access running Visual Studio instance.");
+                return 1;
+            }
+
+            dynamic dte = target.Dte;
+            var solution = TryGetValue(() => (dynamic)dte.Solution);
+            if (solution == null)
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            var isOpen = TryGetValue(() => (bool)solution.IsOpen, false);
+            if (!isOpen)
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            var startupProjects = new List<string>();
+            var displayNames = new List<string>();
+
+            foreach (var selector in selectors)
+            {
+                var project = FindProjectBySelector(solution, selector);
+                if (project == null)
+                {
+                    Console.Error.WriteLine($"Project not found: {selector}");
+                    return 1;
+                }
+
+                var displayName = TryGetValue(() => (string?)project.Name) ?? selector;
+                var uniqueName = TryGetValue(() => (string?)project.UniqueName)
+                    ?? TryGetValue(() => (string?)project.FullName)
+                    ?? displayName;
+
+                if (string.IsNullOrWhiteSpace(uniqueName))
+                {
+                    Console.Error.WriteLine($"Project unique name is unavailable: {displayName}");
+                    return 1;
+                }
+
+                if (!startupProjects.Contains(uniqueName, StringComparer.OrdinalIgnoreCase))
+                {
+                    startupProjects.Add(uniqueName);
+                    displayNames.Add(displayName);
+                }
+            }
+
+            if (startupProjects.Count == 0)
+            {
+                Console.Error.WriteLine("No matching projects found.");
+                return 1;
+            }
+
+            var build = TryGetValue(() => (dynamic)solution.SolutionBuild);
+            if (build == null)
+            {
+                Console.Error.WriteLine("Solution build service is unavailable.");
+                return 1;
+            }
+
+            build.StartupProjects = startupProjects.ToArray();
+
+            Console.WriteLine("Startup projects set to:");
+            foreach (var name in displayNames)
+            {
+                Console.WriteLine($"  - {name}");
+            }
+
+            return 0;
         }
         catch (COMException ex)
         {
