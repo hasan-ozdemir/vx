@@ -29,6 +29,7 @@ dotnet run --project src/vx -- build !*ios
 dotnet run --project src/vx -- deploy !*ios
 dotnet run --project src/vx -- startup !*ios
 dotnet run --project src/vx -- startups !*ios;!*api*
+dotnet run --project src/vx -- startups !*ios !*api*
 dotnet run --project src/vx -- !BotyumApp:build
 dotnet run --project src/vx -- !BotyumApp:rebuild
 dotnet run --project src/vx -- !BotyumApp:clean
@@ -60,6 +61,6 @@ Options:
 `vx build`, `vx rebuild`, and `vx clean` operate on the active solution. Add a project pattern to target the first match (wildcard `*` supported).
 `vx deploy !projectPattern` deploys the first matching project (wildcard `*` supported).
 `vx startup !projectPattern` sets the startup project by pattern.
-`vx startups !pattern1;!pattern2` sets multiple startup projects by patterns.
+`vx startups !pattern1;!pattern2` (quote the argument in PowerShell) or `vx startups !pattern1 !pattern2` sets multiple startup projects by patterns.
 `vx !ProjectName:build|rebuild|clean|deploy` runs the action for a specific project in the active solution (wildcard `*` supported in the project name).
 

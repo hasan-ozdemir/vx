@@ -555,14 +555,19 @@ internal static class Program
             return 1;
         }
 
-        var raw = string.Join(" ", args).Trim();
-        if (string.IsNullOrWhiteSpace(raw))
+        var tokens = args
+            .SelectMany(arg => arg.Split(';', StringSplitOptions.RemoveEmptyEntries))
+            .Select(token => token.Trim())
+            .Where(token => !string.IsNullOrWhiteSpace(token))
+            .ToList();
+
+        if (tokens.Count == 0)
         {
             Console.Error.WriteLine("Usage: vx startups !pattern1;!pattern2");
             return 1;
         }
 
-        var selectors = raw.Split(';', StringSplitOptions.RemoveEmptyEntries)
+        var selectors = tokens
             .Select(s => NormalizeProjectSelector(s))
             .Where(s => !string.IsNullOrWhiteSpace(s))
             .ToList();
