@@ -25,6 +25,8 @@ internal static class Program
                 return RunInfo(args.Skip(1).ToArray());
             case "open":
                 return RunOpen(args.Skip(1).ToArray());
+            case "view":
+                return RunView(args.Skip(1).ToArray());
             default:
                 Console.Error.WriteLine($"Unknown command: {args[0]}");
                 PrintHelp();
@@ -49,10 +51,13 @@ internal static class Program
         Console.WriteLine("Usage:");
         Console.WriteLine("  vx info [--all] [--instance N] [--json]");
         Console.WriteLine("  vx open solution <path>");
+        Console.WriteLine("  vx view <filename>");
+        Console.WriteLine("  vx view @ProjectName:<filename>");
         Console.WriteLine();
         Console.WriteLine("Commands:");
         Console.WriteLine("  info   Show details about running VS2022 instances.");
         Console.WriteLine("  open   Open a solution in Visual Studio 2022.");
+        Console.WriteLine("  view   Open a file in the active solution.");
     }
 
     private static int RunInfo(string[] args)
@@ -195,6 +200,113 @@ internal static class Program
         }
     }
 
+    private static int RunView(string[] args)
+    {
+        if (args.Length == 0)
+        {
+            Console.Error.WriteLine("Usage: vx view <filename> | vx view @ProjectName:<filename>");
+            return 1;
+        }
+
+        var rawTarget = string.Join(" ", args).Trim();
+        if (string.IsNullOrWhiteSpace(rawTarget))
+        {
+            Console.Error.WriteLine("Missing file name.");
+            return 1;
+        }
+
+        string? projectName = null;
+        var fileSpec = rawTarget;
+        if (rawTarget.StartsWith("@", StringComparison.Ordinal))
+        {
+            var separator = rawTarget.IndexOf(':');
+            if (separator <= 1 || separator == rawTarget.Length - 1)
+            {
+                Console.Error.WriteLine("Usage: vx view @ProjectName:<filename>");
+                return 1;
+            }
+
+            projectName = rawTarget.Substring(1, separator - 1).Trim();
+            fileSpec = rawTarget.Substring(separator + 1).Trim();
+            if (string.IsNullOrWhiteSpace(projectName) || string.IsNullOrWhiteSpace(fileSpec))
+            {
+                Console.Error.WriteLine("Usage: vx view @ProjectName:<filename>");
+                return 1;
+            }
+        }
+
+        var instances = VsRot.GetRunningDteInstances();
+        try
+        {
+            OleMessageFilter.Register();
+            if (instances.Count == 0)
+            {
+                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
+                return 1;
+            }
+
+            var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
+            if (target.Dte == null)
+            {
+                Console.Error.WriteLine("Failed to access running Visual Studio instance.");
+                return 1;
+            }
+
+            dynamic dte = target.Dte;
+            var solution = TryGetValue(() => (dynamic)dte.Solution);
+            if (solution == null)
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            var isOpen = TryGetValue(() => (bool)solution.IsOpen, false);
+            if (!isOpen)
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            dynamic? project = null;
+            if (!string.IsNullOrWhiteSpace(projectName))
+            {
+                project = FindProjectByName(solution, projectName);
+                if (project == null)
+                {
+                    Console.Error.WriteLine($"Project not found: {projectName}");
+                    return 1;
+                }
+            }
+
+            var path = project != null ? FindFileInProject(project, fileSpec) : FindFileInSolution(solution, fileSpec);
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                var scope = projectName != null ? $"project '{projectName}'" : "solution";
+                Console.Error.WriteLine($"File not found in {scope}: {fileSpec}");
+                return 1;
+            }
+
+            dte.ItemOperations.OpenFile(path);
+            TryActivateMainWindow(dte);
+            return 0;
+        }
+        catch (COMException ex)
+        {
+            Console.Error.WriteLine($"Visual Studio automation error: {ex.Message}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            return 1;
+        }
+        finally
+        {
+            OleMessageFilter.Revoke();
+            VsRot.ReleaseInstances(instances);
+        }
+    }
+
     private static void OpenInExistingInstance(object dteObject, string solutionPath)
     {
         dynamic dte = dteObject;
@@ -238,6 +350,226 @@ internal static class Program
         catch
         {
             // Ignore activation failures.
+        }
+    }
+
+    private const string SolutionFolderKind = "{66A26720-8FB5-11D2-AA7E-00C04F688DDE}";
+
+    private static dynamic? FindProjectByName(dynamic solution, string projectName)
+    {
+        var projects = TryGetValue(() => (dynamic)solution.Projects);
+        foreach (var project in EnumerateProjects(projects))
+        {
+            var name = TryGetValue(() => (string?)project.Name);
+            if (string.Equals(name, projectName, StringComparison.OrdinalIgnoreCase))
+            {
+                return project;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? FindFileInSolution(dynamic solution, string fileSpec)
+    {
+        var projects = TryGetValue(() => (dynamic)solution.Projects);
+        foreach (var project in EnumerateProjects(projects))
+        {
+            var path = FindFileInProject(project, fileSpec);
+            if (!string.IsNullOrWhiteSpace(path))
+            {
+                return path;
+            }
+        }
+
+        return null;
+    }
+
+    private static string? FindFileInProject(dynamic project, string fileSpec)
+    {
+        var items = TryGetValue(() => (dynamic)project.ProjectItems);
+        return FindFileInProjectItems(items, fileSpec);
+    }
+
+    private static string? FindFileInProjectItems(dynamic items, string fileSpec)
+    {
+        if (items == null)
+        {
+            return null;
+        }
+
+        foreach (var item in EnumerateProjectItems(items))
+        {
+            var fileCount = TryGetValue(() => (short)item.FileCount, (short)0);
+            for (short i = 1; i <= fileCount; i++)
+            {
+                var path = TryGetValue(() => (string?)item.FileNames(i));
+                if (IsPathMatch(path, fileSpec))
+                {
+                    return path;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static IEnumerable<dynamic> EnumerateProjects(dynamic projects)
+    {
+        foreach (var project in EnumerateComCollection(projects))
+        {
+            foreach (var nested in EnumerateProjectNode(project))
+            {
+                yield return nested;
+            }
+        }
+    }
+
+    private static IEnumerable<dynamic> EnumerateProjectNode(dynamic project)
+    {
+        if (project == null)
+        {
+            yield break;
+        }
+
+        var kind = TryGetValue(() => (string?)project.Kind);
+        if (string.Equals(kind, SolutionFolderKind, StringComparison.OrdinalIgnoreCase))
+        {
+            var items = TryGetValue(() => (dynamic)project.ProjectItems);
+            foreach (var item in EnumerateComCollection(items))
+            {
+                var subProject = TryGetValue(() => (dynamic)item.SubProject);
+                foreach (var nested in EnumerateProjectNode(subProject))
+                {
+                    yield return nested;
+                }
+            }
+        }
+        else
+        {
+            yield return project;
+        }
+    }
+
+    private static IEnumerable<dynamic> EnumerateProjectItems(dynamic items)
+    {
+        foreach (var item in EnumerateComCollection(items))
+        {
+            if (item == null)
+            {
+                continue;
+            }
+
+            yield return item;
+
+            var nestedItems = TryGetValue(() => (dynamic)item.ProjectItems);
+            if (nestedItems == null)
+            {
+                continue;
+            }
+
+            foreach (var nested in EnumerateProjectItems(nestedItems))
+            {
+                yield return nested;
+            }
+        }
+    }
+
+    private static IEnumerable<dynamic> EnumerateComCollection(dynamic collection)
+    {
+        if (collection == null)
+        {
+            yield break;
+        }
+
+        if (collection is IEnumerable enumerable)
+        {
+            foreach (var item in enumerable)
+            {
+                yield return item;
+            }
+
+            yield break;
+        }
+
+        int count;
+        try
+        {
+            count = collection.Count;
+        }
+        catch
+        {
+            yield break;
+        }
+
+        for (var i = 1; i <= count; i++)
+        {
+            object? item = null;
+            try
+            {
+                item = collection.Item(i);
+            }
+            catch
+            {
+                // Skip invalid items.
+            }
+
+            if (item != null)
+            {
+                yield return item;
+            }
+        }
+    }
+
+    private static bool IsPathMatch(string? candidatePath, string fileSpec)
+    {
+        if (string.IsNullOrWhiteSpace(candidatePath) || string.IsNullOrWhiteSpace(fileSpec))
+        {
+            return false;
+        }
+
+        var candidate = candidatePath.Replace('/', '\\');
+        var spec = fileSpec.Replace('/', '\\');
+
+        if (Path.IsPathRooted(spec))
+        {
+            try
+            {
+                var fullCandidate = Path.GetFullPath(candidate);
+                var fullSpec = Path.GetFullPath(spec);
+                return string.Equals(fullCandidate, fullSpec, StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return string.Equals(candidate, spec, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        if (spec.Contains('\\'))
+        {
+            return candidate.EndsWith(spec, StringComparison.OrdinalIgnoreCase);
+        }
+
+        return string.Equals(Path.GetFileName(candidate), spec, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static T? TryGetValue<T>(Func<T> action, T? fallback = default)
+    {
+        try
+        {
+            return action();
+        }
+        catch (COMException)
+        {
+            return fallback;
+        }
+        catch (InvalidCastException)
+        {
+            return fallback;
+        }
+        catch
+        {
+            return fallback;
         }
     }
 
