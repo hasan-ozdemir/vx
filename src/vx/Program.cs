@@ -1,6 +1,7 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -705,7 +706,7 @@ internal static class Program
                 Console.WriteLine($"*[{page.Name}]:");
                 foreach (var item in page.Items)
                 {
-                    var value = SafeFormatPropertyValue(item.Property);
+                    var value = SafeFormatPropertyValue(item);
                     Console.WriteLine($"-{item.Name}: {value}");
                 }
             }
@@ -903,7 +904,7 @@ internal static class Program
             {
                 for (var i = 0; i < items.Count; i++)
                 {
-                    var value = SafeFormatPropertyValue(items[i].Property);
+                    var value = SafeFormatPropertyValue(items[i]);
                     Console.WriteLine($"{i + 1}. {items[i].Name} = {value}");
                 }
             }
@@ -950,11 +951,10 @@ internal static class Program
 
     private static void UpdatePropertyValue(PropertyEntry entry)
     {
-        var currentValue = (object?)TryGetValue(() => entry.Property.Value);
+        var currentValue = GetPropertyValue(entry);
         var formattedCurrent = FormatPropertyValue(currentValue);
 
-        var isReadOnly = TryGetValue(() => (bool)entry.Property.IsReadOnly, false)
-            || TryGetValue(() => (bool)entry.Property.ReadOnly, false);
+        var isReadOnly = IsPropertyReadOnly(entry);
 
         if (isReadOnly)
         {
@@ -993,7 +993,7 @@ internal static class Program
             return;
         }
 
-        if (!TryConvertPropertyValue(newValue, currentValue, out object? converted, out string hint))
+        if (!TryConvertPropertyValue(entry, newValue, currentValue, out object? converted, out string hint))
         {
             Console.WriteLine($"Invalid value. {hint}");
             return;
@@ -1001,7 +1001,7 @@ internal static class Program
 
         try
         {
-            entry.Property.Value = converted;
+            SetPropertyValue(entry, converted);
             Console.WriteLine("Property updated successfully.");
         }
         catch (COMException ex)
@@ -1014,23 +1014,19 @@ internal static class Program
         }
     }
 
-    private static bool TryConvertPropertyValue(string input, object? currentValue, out object? converted, out string hint)
+    private static bool TryConvertPropertyValue(PropertyEntry entry, string input, object? currentValue, out object? converted, out string hint)
     {
         hint = string.Empty;
         converted = input;
 
-        if (currentValue == null)
+        var targetType = currentValue?.GetType() ?? entry.Descriptor?.PropertyType;
+
+        if (targetType == null || targetType == typeof(string))
         {
             return true;
         }
 
-        var type = currentValue.GetType();
-        if (type == typeof(string))
-        {
-            return true;
-        }
-
-        if (type == typeof(bool))
+        if (targetType == typeof(bool))
         {
             if (TryParseBool(input, out var boolValue))
             {
@@ -1042,28 +1038,53 @@ internal static class Program
             return false;
         }
 
-        if (type.IsEnum)
+        if (targetType.IsEnum)
         {
             try
             {
-                converted = Enum.Parse(type, input, true);
+                converted = Enum.Parse(targetType, input, true);
                 return true;
             }
             catch
             {
-                hint = $"Expected one of: {string.Join(", ", Enum.GetNames(type))}";
+                hint = $"Expected one of: {string.Join(", ", Enum.GetNames(targetType))}";
+                return false;
+            }
+        }
+
+        var converter = entry.Descriptor?.Converter ?? TypeDescriptor.GetConverter(targetType);
+        if (converter != null && converter.CanConvertFrom(typeof(string)))
+        {
+            try
+            {
+                converted = converter.ConvertFromInvariantString(input);
+                return true;
+            }
+            catch
+            {
+                if (converter.GetStandardValuesSupported())
+                {
+                    var values = converter.GetStandardValues();
+                    if (values != null)
+                    {
+                        hint = $"Expected one of: {string.Join(", ", values.Cast<object>())}";
+                        return false;
+                    }
+                }
+
+                hint = $"Expected {targetType.Name} value.";
                 return false;
             }
         }
 
         try
         {
-            converted = Convert.ChangeType(input, type);
+            converted = Convert.ChangeType(input, targetType);
             return true;
         }
         catch
         {
-            hint = $"Expected {type.Name} value.";
+            hint = $"Expected {targetType.Name} value.";
             return false;
         }
     }
@@ -1107,27 +1128,60 @@ internal static class Program
     {
         var pages = new List<PropertyPage>();
 
-        var projectProps = TryGetValue(() => (dynamic)project.Properties);
-        AddPropertyPage(pages, "Project Properties", projectProps);
+        var projectObject = TryGetValue(() => (object?)project.Object) ?? (object?)project;
+        AddPropertyPagesFromObject(pages, projectObject, "Common Properties");
 
         var configManager = TryGetValue(() => (dynamic)project.ConfigurationManager);
-        var configs = TryGetValue(() => (dynamic)configManager?.Configurations);
-        foreach (var config in EnumerateComCollection(configs))
-        {
-            var configName = TryGetValue(() => (string?)config.ConfigurationName) ?? "Configuration";
-            var platformName = TryGetValue(() => (string?)config.PlatformName);
-            var pageName = string.IsNullOrWhiteSpace(platformName)
-                ? $"Configuration: {configName}"
-                : $"Configuration: {configName}|{platformName}";
+        var activeConfig = TryGetValue(() => (dynamic)configManager?.ActiveConfiguration);
+        var configObject = TryGetValue(() => (object?)activeConfig?.Object) ?? (object?)activeConfig;
+        AddPropertyPagesFromObject(pages, configObject, "Configuration Properties");
 
-            var configProps = TryGetValue(() => (dynamic)config.Properties);
-            AddPropertyPage(pages, pageName, configProps);
+        if (pages.Count == 0)
+        {
+            var projectProps = TryGetValue(() => (dynamic)project.Properties);
+            AddPropertyPageFromComProperties(pages, "Project Properties", projectProps);
         }
 
-        return pages;
+        return pages
+            .OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
 
-    private static void AddPropertyPage(List<PropertyPage> pages, string name, dynamic properties)
+    private static void AddPropertyPagesFromObject(List<PropertyPage> pages, object? target, string sectionName)
+    {
+        if (target == null)
+        {
+            return;
+        }
+
+        var descriptors = TypeDescriptor.GetProperties(target);
+        foreach (PropertyDescriptor descriptor in descriptors)
+        {
+            if (!descriptor.IsBrowsable)
+            {
+                continue;
+            }
+
+            var category = string.IsNullOrWhiteSpace(descriptor.Category) ? "General" : descriptor.Category;
+            var pageName = $"{sectionName} / {category}";
+            var page = pages.FirstOrDefault(p => string.Equals(p.Name, pageName, StringComparison.OrdinalIgnoreCase));
+            if (page == null)
+            {
+                page = new PropertyPage(pageName, new List<PropertyEntry>());
+                pages.Add(page);
+            }
+
+            var displayName = string.IsNullOrWhiteSpace(descriptor.DisplayName) ? descriptor.Name : descriptor.DisplayName;
+            page.Items.Add(new PropertyEntry(displayName, target, descriptor));
+        }
+
+        foreach (var page in pages)
+        {
+            page.Items.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    private static void AddPropertyPageFromComProperties(List<PropertyPage> pages, string name, dynamic properties)
     {
         if (properties == null)
         {
@@ -1159,11 +1213,11 @@ internal static class Program
         pages.Add(new PropertyPage(name, items));
     }
 
-    private static string SafeFormatPropertyValue(dynamic property)
+    private static string SafeFormatPropertyValue(PropertyEntry entry)
     {
         try
         {
-            var value = property.Value;
+            var value = GetPropertyValue(entry);
             return FormatPropertyValue(value);
         }
         catch (COMException ex)
@@ -1174,6 +1228,51 @@ internal static class Program
         {
             return $"<unavailable: {ex.Message}>";
         }
+    }
+
+    private static object? GetPropertyValue(PropertyEntry entry)
+    {
+        if (entry.Descriptor != null && entry.Owner != null)
+        {
+            return entry.Descriptor.GetValue(entry.Owner);
+        }
+
+        if (entry.ComProperty != null)
+        {
+            return entry.ComProperty.Value;
+        }
+
+        return null;
+    }
+
+    private static void SetPropertyValue(PropertyEntry entry, object? value)
+    {
+        if (entry.Descriptor != null && entry.Owner != null)
+        {
+            entry.Descriptor.SetValue(entry.Owner, value);
+            return;
+        }
+
+        if (entry.ComProperty != null)
+        {
+            entry.ComProperty.Value = value;
+        }
+    }
+
+    private static bool IsPropertyReadOnly(PropertyEntry entry)
+    {
+        if (entry.Descriptor != null)
+        {
+            return entry.Descriptor.IsReadOnly;
+        }
+
+        if (entry.ComProperty != null)
+        {
+            return TryGetValue(() => (bool)entry.ComProperty.IsReadOnly, false)
+                || TryGetValue(() => (bool)entry.ComProperty.ReadOnly, false);
+        }
+
+        return true;
     }
 
     private static string FormatPropertyValue(object? value)
@@ -2288,14 +2387,23 @@ internal static class Program
 
     private sealed class PropertyEntry
     {
-        public PropertyEntry(string name, dynamic property)
+        public PropertyEntry(string name, dynamic comProperty)
         {
             Name = name;
-            Property = property;
+            ComProperty = comProperty;
+        }
+
+        public PropertyEntry(string name, object owner, PropertyDescriptor descriptor)
+        {
+            Name = name;
+            Owner = owner;
+            Descriptor = descriptor;
         }
 
         public string Name { get; }
-        public dynamic Property { get; }
+        public object? Owner { get; }
+        public PropertyDescriptor? Descriptor { get; }
+        public dynamic? ComProperty { get; }
     }
 
     private sealed class ProjectEntry
