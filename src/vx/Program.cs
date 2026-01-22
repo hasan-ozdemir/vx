@@ -9,6 +9,9 @@ using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows;
+using System.Windows.Automation;
 using Microsoft.Build.Construction;
 using Microsoft.Build.Evaluation;
 using Microsoft.Build.Locator;
@@ -716,6 +719,12 @@ internal static class Program
                 return 1;
             }
 
+            using var uiaSession = UiaPropertySession.TryCreate(dte, project);
+            if (uiaSession != null)
+            {
+                OverlayUiaValues(pages, uiaSession);
+            }
+
             foreach (var page in pages.Where(p => p.Items.Count > 0))
             {
                 Console.WriteLine($"*[{page.Name}]:");
@@ -784,7 +793,8 @@ internal static class Program
             }
 
             var includeMsBuild = PrepareMsBuild();
-            return RunPropertyWizardForProject(project, includeMsBuild);
+            using var uiaSession = UiaPropertySession.TryCreate(dte, project);
+            return RunPropertyWizardForProject(project, includeMsBuild, uiaSession);
         }
         catch (COMException ex)
         {
@@ -848,7 +858,7 @@ internal static class Program
         }
     }
 
-    private static int RunPropertyWizardForProject(dynamic project, bool includeMsBuild)
+    private static int RunPropertyWizardForProject(dynamic project, bool includeMsBuild, UiaPropertySession? uiaSession)
     {
         var pages = GetProjectPropertyPages((object?)project, includeMsBuild);
         if (pages.Count == 0)
@@ -862,6 +872,11 @@ internal static class Program
         {
             Console.WriteLine("No project properties found.");
             return 1;
+        }
+
+        if (uiaSession != null)
+        {
+            OverlayUiaValues(pages, uiaSession);
         }
 
         while (true)
@@ -896,14 +911,14 @@ internal static class Program
             }
 
             var page = pages[pageIndex - 1];
-            if (RunPropertyWizardForPage(page) == 0)
+            if (RunPropertyWizardForPage(page, uiaSession) == 0)
             {
                 continue;
             }
         }
     }
 
-    private static int RunPropertyWizardForPage(PropertyPage page)
+    private static int RunPropertyWizardForPage(PropertyPage page, UiaPropertySession? uiaSession)
     {
         var filter = string.Empty;
         while (true)
@@ -967,11 +982,11 @@ internal static class Program
             }
 
             var item = items[propIndex - 1];
-            UpdatePropertyValue(item);
+            UpdatePropertyValue(page, item, uiaSession);
         }
     }
 
-    private static void UpdatePropertyValue(PropertyEntry entry)
+    private static void UpdatePropertyValue(PropertyPage page, PropertyEntry entry, UiaPropertySession? uiaSession)
     {
         var currentValue = GetPropertyValue(entry);
         var formattedCurrent = FormatPropertyValue(currentValue);
@@ -985,7 +1000,9 @@ internal static class Program
         }
 
         Console.WriteLine($"*update {entry.Name} value:");
-        Console.Write($"-enter new value <{formattedCurrent}>: ");
+        Console.Write("-enter new value ");
+        Console.Write($"<{formattedCurrent}> ");
+        Console.Write("(use !delete to remove): ");
         var input = Console.ReadLine();
         if (input == null)
         {
@@ -1003,6 +1020,19 @@ internal static class Program
         }
 
         var newValue = input.Trim();
+        if (IsDeleteCommand(newValue))
+        {
+            if (TryDeleteProperty(entry, page, uiaSession, out var deleteMessage))
+            {
+                Console.WriteLine(deleteMessage ?? "Property deleted successfully.");
+            }
+            else
+            {
+                Console.WriteLine(deleteMessage ?? "Failed to delete property.");
+            }
+
+            return;
+        }
         if (string.IsNullOrEmpty(newValue) ||
             string.Equals(newValue, formattedCurrent, StringComparison.OrdinalIgnoreCase))
         {
@@ -1033,13 +1063,29 @@ internal static class Program
         {
             SetPropertyValue(entry, converted);
             Console.WriteLine("Property updated successfully.");
+            if (entry.UiaValue != null)
+            {
+                entry.UiaValue = converted;
+            }
         }
         catch (COMException ex)
         {
+            if (TrySetPropertyViaUiAutomation(page, entry, converted, uiaSession, out var message))
+            {
+                Console.WriteLine(message ?? "Property updated successfully via UI Automation.");
+                return;
+            }
+
             Console.WriteLine($"Failed to update property: {ex.Message}");
         }
         catch (Exception ex)
         {
+            if (TrySetPropertyViaUiAutomation(page, entry, converted, uiaSession, out var message))
+            {
+                Console.WriteLine(message ?? "Property updated successfully via UI Automation.");
+                return;
+            }
+
             Console.WriteLine($"Failed to update property: {ex.Message}");
         }
     }
@@ -1154,9 +1200,22 @@ internal static class Program
         return string.Equals(input.Trim(), "b", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsDeleteCommand(string input)
+    {
+        if (string.IsNullOrWhiteSpace(input))
+        {
+            return false;
+        }
+
+        var normalized = input.Trim();
+        return string.Equals(normalized, "!delete", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(normalized, "!del", StringComparison.OrdinalIgnoreCase);
+    }
+
     private static bool MsBuildRegistrationAttempted;
     private static bool MsBuildRegistrationSucceeded;
     private static bool MsBuildRegistrationLogged;
+    private static bool UiaUnavailableLogged;
 
     private static readonly string[] KnownPropertyPages =
     {
@@ -1385,6 +1444,17 @@ internal static class Program
 
             Func<object?> getter = () => cachedValue;
             var entry = new PropertyEntry(name, name, category, getter, setter, inferredType, PropertySource.MsBuild);
+            entry.DeleteAction = () =>
+            {
+                string? deleteMessage;
+                var success = RemoveMsBuildProperty(projectPath, globalProperties, name, out deleteMessage);
+                if (success)
+                {
+                    cachedValue = null;
+                }
+
+                return (success, deleteMessage);
+            };
             AddPropertyEntry(pages, pageName, entry);
         }
     }
@@ -1501,6 +1571,17 @@ internal static class Program
         }
 
         return success;
+    }
+
+    private static void LogUiaUnavailable(string message)
+    {
+        if (UiaUnavailableLogged)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"UI Automation unavailable: {message}");
+        UiaUnavailableLogged = true;
     }
 
     private static bool TryRegisterMsBuildViaVswhere(out string? error)
@@ -1822,6 +1903,38 @@ internal static class Program
         collection.UnloadAllProjects();
     }
 
+    private static bool RemoveMsBuildProperty(string projectPath, IDictionary<string, string> globalProperties, string propertyName, out string? message)
+    {
+        message = null;
+
+        using var collection = new ProjectCollection(globalProperties);
+        var project = collection.LoadProject(projectPath);
+
+        var property = project.GetProperty(propertyName);
+        if (property == null)
+        {
+            message = "Property not found in project file.";
+            return false;
+        }
+
+        if (property.IsImported)
+        {
+            message = "Property is imported and cannot be deleted. Consider overriding it instead.";
+            return false;
+        }
+
+        if (property.Xml?.Parent == null)
+        {
+            message = "Property location could not be determined.";
+            return false;
+        }
+
+        property.Xml.Parent.RemoveChild(property.Xml);
+        project.Save();
+        collection.UnloadAllProjects();
+        return true;
+    }
+
     private static string? BuildConfigurationCondition(IDictionary<string, string> globalProperties)
     {
         globalProperties.TryGetValue("Configuration", out var configuration);
@@ -1938,6 +2051,83 @@ internal static class Program
         }
 
         return rebuilt;
+    }
+
+    private static void OverlayUiaValues(List<PropertyPage> pages, UiaPropertySession uiaSession)
+    {
+        var uiaValues = uiaSession.ReadAllPages();
+        foreach (var pagePair in uiaValues)
+        {
+            var pageName = pagePair.Key;
+            var page = pages.FirstOrDefault(p => string.Equals(p.Name, pageName, StringComparison.OrdinalIgnoreCase));
+            if (page == null)
+            {
+                page = new PropertyPage(pageName, new List<PropertyEntry>());
+                pages.Add(page);
+            }
+
+            foreach (var propertyPair in pagePair.Value)
+            {
+                var key = NormalizePropertyKey(propertyPair.Key);
+                var existing = page.Items.FirstOrDefault(item =>
+                    string.Equals(NormalizePropertyKey(item.Key), key, StringComparison.OrdinalIgnoreCase));
+
+                if (existing != null)
+                {
+                    existing.UiaValue = propertyPair.Value;
+                    continue;
+                }
+
+                var entry = new PropertyEntry(propertyPair.Key, propertyPair.Key, pageName, (object?)propertyPair.Value);
+                page.Items.Add(entry);
+            }
+        }
+    }
+
+    private static bool TrySetPropertyViaUiAutomation(PropertyPage page, PropertyEntry entry, object? value, UiaPropertySession? uiaSession, out string? message)
+    {
+        message = null;
+        if (uiaSession == null)
+        {
+            return false;
+        }
+
+        var textValue = value?.ToString() ?? string.Empty;
+        if (uiaSession.TrySetProperty(page.Name, entry.Name, textValue, out message))
+        {
+            entry.UiaValue = textValue;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool TryDeleteProperty(PropertyEntry entry, PropertyPage page, UiaPropertySession? uiaSession, out string? message)
+    {
+        message = null;
+        if (entry.DeleteAction != null)
+        {
+            var result = entry.DeleteAction();
+            message = result.Message;
+            return result.Success;
+        }
+
+        if (TrySetPropertyViaUiAutomation(page, entry, string.Empty, uiaSession, out message))
+        {
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                message = "Property cleared via UI Automation.";
+            }
+
+            return true;
+        }
+
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            message = "Delete is not supported for this property.";
+        }
+
+        return false;
     }
 
     private static string NormalizePageName(string pageName)
@@ -2181,6 +2371,11 @@ internal static class Program
     {
         try
         {
+            if (entry.UiaValue != null)
+            {
+                return FormatPropertyValue(entry.UiaValue);
+            }
+
             if (entry.Source != PropertySource.MsBuild && entry.FallbackValue != null)
             {
                 return FormatPropertyValue(entry.FallbackValue);
@@ -2228,6 +2423,16 @@ internal static class Program
 
     private static object? GetPropertyValue(PropertyEntry entry)
     {
+        if (entry.UiaValue != null)
+        {
+            return entry.UiaValue;
+        }
+
+        if (entry.Source != PropertySource.MsBuild && entry.FallbackValue != null)
+        {
+            return entry.FallbackValue;
+        }
+
         if (entry.Getter != null)
         {
             return entry.Getter();
@@ -2763,6 +2968,97 @@ internal static class Program
         {
             // Ignore activation failures.
         }
+    }
+
+    private const int VsUiSelectionTypeSelect = 1;
+
+    private static bool TrySelectProjectInSolutionExplorer(dynamic dte, dynamic project)
+    {
+        try
+        {
+            var explorer = TryGetValue(() => (dynamic)dte.ToolWindows.SolutionExplorer);
+            if (explorer == null)
+            {
+                return false;
+            }
+
+            var rootItems = TryGetValue(() => (dynamic)explorer.UIHierarchyItems);
+            foreach (var item in EnumerateComCollection(rootItems))
+            {
+                var match = FindProjectHierarchyItem(item, project);
+                if (match != null)
+                {
+                    TryInvoke(() => match.Select(VsUiSelectionTypeSelect), out _);
+                    return true;
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+
+        return false;
+    }
+
+    private static dynamic? FindProjectHierarchyItem(dynamic item, dynamic project)
+    {
+        if (item == null)
+        {
+            return null;
+        }
+
+        var itemObject = TryGetValue(() => (dynamic)item.Object);
+        if (itemObject != null)
+        {
+            var itemUnique = TryGetValue(() => (string?)itemObject.UniqueName);
+            var projectUnique = TryGetValue(() => (string?)project.UniqueName);
+            if (!string.IsNullOrWhiteSpace(itemUnique) && !string.IsNullOrWhiteSpace(projectUnique) &&
+                string.Equals(itemUnique, projectUnique, StringComparison.OrdinalIgnoreCase))
+            {
+                return item;
+            }
+
+            var itemName = TryGetValue(() => (string?)itemObject.Name);
+            var projectName = TryGetValue(() => (string?)project.Name);
+            if (!string.IsNullOrWhiteSpace(itemName) && !string.IsNullOrWhiteSpace(projectName) &&
+                string.Equals(itemName, projectName, StringComparison.OrdinalIgnoreCase))
+            {
+                return item;
+            }
+        }
+
+        var children = TryGetValue(() => (dynamic)item.UIHierarchyItems);
+        foreach (var child in EnumerateComCollection(children))
+        {
+            var found = FindProjectHierarchyItem(child, project);
+            if (found != null)
+            {
+                return found;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool TryOpenProjectProperties(dynamic dte)
+    {
+        if (TryInvoke(() => dte.ExecuteCommand("Project.Properties"), out _))
+        {
+            return true;
+        }
+
+        if (TryInvoke(() => dte.ExecuteCommand("Project.ProjectProperties"), out _))
+        {
+            return true;
+        }
+
+        if (TryInvoke(() => dte.ExecuteCommand("File.Properties"), out _))
+        {
+            return true;
+        }
+
+        return TryInvoke(() => dte.ExecuteCommand("View.PropertiesWindow"), out _);
     }
 
     private static string? GetActiveDocumentText(dynamic activeDocument)
@@ -3440,6 +3736,7 @@ internal static class Program
 
     private enum PropertySource
     {
+        UiAutomation = -1,
         MsBuild = 0,
         DteDescriptor = 1,
         ComProperty = 2
@@ -3472,6 +3769,584 @@ internal static class Program
         {
             Collection.UnloadAllProjects();
             Collection.Dispose();
+        }
+    }
+
+    private readonly struct UiaRow
+    {
+        public UiaRow(string name, string value, AutomationElement? valueElement)
+        {
+            Name = name;
+            Value = value;
+            ValueElement = valueElement;
+        }
+
+        public string Name { get; }
+        public string Value { get; }
+        public AutomationElement? ValueElement { get; }
+    }
+
+    private sealed class UiaPropertySession : IDisposable
+    {
+        private const int UiDelayMilliseconds = 150;
+        private readonly AutomationElement _vsRoot;
+        private readonly AutomationElement _propertyRoot;
+        private readonly AutomationElement _pageTree;
+        private readonly Dictionary<string, AutomationElement> _pageItems;
+
+        private UiaPropertySession(
+            AutomationElement vsRoot,
+            AutomationElement propertyRoot,
+            AutomationElement pageTree,
+            Dictionary<string, AutomationElement> pageItems)
+        {
+            _vsRoot = vsRoot;
+            _propertyRoot = propertyRoot;
+            _pageTree = pageTree;
+            _pageItems = pageItems;
+        }
+
+        public static UiaPropertySession? TryCreate(dynamic dte, dynamic project)
+        {
+            try
+            {
+                TryInvoke(() => dte.MainWindow.Activate(), out _);
+                if (!TrySelectProjectInSolutionExplorer(dte, project))
+                {
+                    LogUiaUnavailable("Project could not be selected in Solution Explorer.");
+                    return null;
+                }
+
+                if (!TryOpenProjectProperties(dte))
+                {
+                    LogUiaUnavailable("Project properties command is unavailable.");
+                    return null;
+                }
+
+                var hwnd = TryGetValue(() => (int)dte.MainWindow.HWnd, 0);
+                if (hwnd == 0)
+                {
+                    LogUiaUnavailable("Main window handle unavailable.");
+                    return null;
+                }
+
+                var vsRoot = AutomationElement.FromHandle(new IntPtr(hwnd));
+                if (vsRoot == null)
+                {
+                    LogUiaUnavailable("Unable to access Visual Studio UI Automation root.");
+                    return null;
+                }
+
+                var projectName = TryGetValue(() => (string?)project.Name) ?? string.Empty;
+                var propertyRoot = WaitForPropertyPagesRoot(vsRoot, projectName);
+                if (propertyRoot == null)
+                {
+                    LogUiaUnavailable("Project property pages UI not found.");
+                    return null;
+                }
+
+                var pageTree = FindPropertyPagesTree(propertyRoot);
+                if (pageTree == null)
+                {
+                    LogUiaUnavailable("Property pages navigation tree not found.");
+                    return null;
+                }
+
+                var pages = BuildPageIndex(pageTree);
+                if (pages.Count == 0)
+                {
+                    LogUiaUnavailable("Property pages could not be enumerated.");
+                    return null;
+                }
+
+                return new UiaPropertySession(vsRoot, propertyRoot, pageTree, pages);
+            }
+            catch (Exception ex)
+            {
+                LogUiaUnavailable(ex.Message);
+                return null;
+            }
+        }
+
+        public Dictionary<string, Dictionary<string, string>> ReadAllPages()
+        {
+            var result = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+            foreach (var page in _pageItems)
+            {
+                if (!TrySelectPage(page.Key))
+                {
+                    continue;
+                }
+
+                Thread.Sleep(UiDelayMilliseconds);
+                var rows = ReadPropertyRows(_propertyRoot);
+                if (rows.Count == 0)
+                {
+                    continue;
+                }
+
+                var pageValues = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var row in rows)
+                {
+                    if (!pageValues.ContainsKey(row.Name))
+                    {
+                        pageValues[row.Name] = row.Value;
+                    }
+                }
+
+                result[page.Key] = pageValues;
+            }
+
+            return result;
+        }
+
+        public bool TrySetProperty(string pageName, string propertyName, string newValue, out string? message)
+        {
+            message = null;
+            if (!TrySelectPage(pageName))
+            {
+                message = "Property page could not be selected.";
+                return false;
+            }
+
+            Thread.Sleep(UiDelayMilliseconds);
+            var rows = ReadPropertyRows(_propertyRoot);
+            var targetKey = NormalizePropertyKey(propertyName);
+            var row = rows.FirstOrDefault(r => NormalizePropertyKey(r.Name) == targetKey);
+            if (string.IsNullOrWhiteSpace(row.Name))
+            {
+                message = "Property not found in UI Automation view.";
+                return false;
+            }
+
+            if (row.ValueElement == null)
+            {
+                message = "Property value control not found.";
+                return false;
+            }
+
+            if (TrySetUiaValue(row.ValueElement, newValue, out message))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool TrySelectPage(string pageName)
+        {
+            if (_pageItems.TryGetValue(pageName, out var item))
+            {
+                return TrySelectTreeItem(item);
+            }
+
+            var match = _pageItems.Keys.FirstOrDefault(key =>
+                key.EndsWith(pageName, StringComparison.OrdinalIgnoreCase) ||
+                pageName.EndsWith(key, StringComparison.OrdinalIgnoreCase));
+
+            if (match != null && _pageItems.TryGetValue(match, out var matchedItem))
+            {
+                return TrySelectTreeItem(matchedItem);
+            }
+
+            return false;
+        }
+
+        private static AutomationElement? WaitForPropertyPagesRoot(AutomationElement vsRoot, string projectName)
+        {
+            for (var i = 0; i < 25; i++)
+            {
+                var candidate = FindPropertyPagesRoot(vsRoot, projectName);
+                if (candidate != null)
+                {
+                    return candidate;
+                }
+
+                Thread.Sleep(200);
+            }
+
+            return null;
+        }
+
+        private static AutomationElement? FindPropertyPagesRoot(AutomationElement vsRoot, string projectName)
+        {
+            var conditions = new OrCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Pane),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
+
+            var candidates = vsRoot.FindAll(TreeScope.Descendants, conditions);
+            foreach (AutomationElement candidate in candidates)
+            {
+                var name = candidate.Current.Name ?? string.Empty;
+                if (!name.Contains("Properties", StringComparison.OrdinalIgnoreCase) &&
+                    (string.IsNullOrWhiteSpace(projectName) || !name.Contains(projectName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    continue;
+                }
+
+                var tree = FindPropertyPagesTree(candidate);
+                if (tree != null)
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        private static AutomationElement? FindPropertyPagesTree(AutomationElement root)
+        {
+            var tree = root.FindFirst(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Tree));
+            if (tree != null && ContainsKnownPage(tree))
+            {
+                return tree;
+            }
+
+            var trees = root.FindAll(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Tree));
+            foreach (AutomationElement candidate in trees)
+            {
+                if (ContainsKnownPage(candidate))
+                {
+                    return candidate;
+                }
+            }
+
+            return null;
+        }
+
+        private static bool ContainsKnownPage(AutomationElement tree)
+        {
+            var items = tree.FindAll(TreeScope.Descendants,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TreeItem));
+
+            foreach (AutomationElement item in items)
+            {
+                var name = item.Current.Name;
+                if (string.IsNullOrWhiteSpace(name))
+                {
+                    continue;
+                }
+
+                if (KnownPropertyPages.Any(page => page.EndsWith(name, StringComparison.OrdinalIgnoreCase) ||
+                                                   string.Equals(page, name, StringComparison.OrdinalIgnoreCase)))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static Dictionary<string, AutomationElement> BuildPageIndex(AutomationElement tree)
+        {
+            var map = new Dictionary<string, AutomationElement>(StringComparer.OrdinalIgnoreCase);
+            var rootItems = tree.FindAll(TreeScope.Children,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TreeItem));
+
+            foreach (AutomationElement item in rootItems)
+            {
+                AddTreeItem(map, item, null);
+            }
+
+            return map;
+        }
+
+        private static void AddTreeItem(Dictionary<string, AutomationElement> map, AutomationElement item, string? parentPath)
+        {
+            var name = item.Current.Name;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                return;
+            }
+
+            var path = string.IsNullOrWhiteSpace(parentPath) ? name : $"{parentPath}/{name}";
+            map[path] = item;
+
+            if (TryExpand(item))
+            {
+                Thread.Sleep(UiDelayMilliseconds);
+            }
+
+            var children = item.FindAll(TreeScope.Children,
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TreeItem));
+
+            foreach (AutomationElement child in children)
+            {
+                AddTreeItem(map, child, path);
+            }
+        }
+
+        private static bool TrySelectTreeItem(AutomationElement item)
+        {
+            if (item.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var selection))
+            {
+                ((SelectionItemPattern)selection).Select();
+                return true;
+            }
+
+            if (item.TryGetCurrentPattern(InvokePattern.Pattern, out var invoke))
+            {
+                ((InvokePattern)invoke).Invoke();
+                return true;
+            }
+
+            try
+            {
+                item.SetFocus();
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool TryExpand(AutomationElement item)
+        {
+            if (item.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var pattern))
+            {
+                var expand = (ExpandCollapsePattern)pattern;
+                if (expand.Current.ExpandCollapseState != ExpandCollapseState.Expanded)
+                {
+                    expand.Expand();
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private static List<UiaRow> ReadPropertyRows(AutomationElement root)
+        {
+            var rows = new List<UiaRow>();
+            var grid = FindPropertyGrid(root) ?? root;
+
+            var rowCondition = new OrCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
+
+            var rowItems = grid.FindAll(TreeScope.Descendants, rowCondition);
+            foreach (AutomationElement row in rowItems)
+            {
+                if (TryParseRow(row, out var name, out var value, out var valueElement))
+                {
+                    rows.Add(new UiaRow(name, value, valueElement));
+                }
+            }
+
+            return rows;
+        }
+
+        private static AutomationElement? FindPropertyGrid(AutomationElement root)
+        {
+            var gridCondition = new OrCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataGrid),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Table),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.List));
+
+            return root.FindFirst(TreeScope.Descendants, gridCondition);
+        }
+
+        private static bool TryParseRow(AutomationElement row, out string name, out string value, out AutomationElement? valueElement)
+        {
+            name = string.Empty;
+            value = string.Empty;
+            valueElement = null;
+
+            var candidates = row.FindAll(TreeScope.Descendants, new OrCondition(
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ComboBox),
+                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.CheckBox)));
+
+            if (candidates.Count == 0)
+            {
+                return false;
+            }
+
+            AutomationElement? nameElement = null;
+            var nameRect = new Rect(double.MaxValue, 0, 0, 0);
+            foreach (AutomationElement candidate in candidates)
+            {
+                if (candidate.Current.ControlType != ControlType.Text)
+                {
+                    continue;
+                }
+
+                var candidateName = candidate.Current.Name;
+                if (string.IsNullOrWhiteSpace(candidateName))
+                {
+                    continue;
+                }
+
+                var rect = candidate.Current.BoundingRectangle;
+                if (rect == Rect.Empty)
+                {
+                    continue;
+                }
+
+                if (rect.X < nameRect.X)
+                {
+                    nameElement = candidate;
+                    nameRect = rect;
+                }
+            }
+
+            if (nameElement == null)
+            {
+                return false;
+            }
+
+            name = nameElement.Current.Name;
+
+            AutomationElement? valueCandidate = null;
+            var valueRect = new Rect(double.MinValue, 0, 0, 0);
+            foreach (AutomationElement candidate in candidates)
+            {
+                if (candidate == nameElement)
+                {
+                    continue;
+                }
+
+                var rect = candidate.Current.BoundingRectangle;
+                if (rect == Rect.Empty)
+                {
+                    continue;
+                }
+
+                if (rect.X > valueRect.X)
+                {
+                    valueCandidate = candidate;
+                    valueRect = rect;
+                }
+            }
+
+            if (valueCandidate == null)
+            {
+                return false;
+            }
+
+            value = ReadUiaValue(valueCandidate);
+            valueElement = valueCandidate;
+            return true;
+        }
+
+        private static string ReadUiaValue(AutomationElement element)
+        {
+            if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var valuePattern))
+            {
+                return ((ValuePattern)valuePattern).Current.Value ?? string.Empty;
+            }
+
+            if (element.TryGetCurrentPattern(TogglePattern.Pattern, out var togglePattern))
+            {
+                var state = ((TogglePattern)togglePattern).Current.ToggleState;
+                return state == ToggleState.On ? "True" : "False";
+            }
+
+            if (element.TryGetCurrentPattern(SelectionPattern.Pattern, out var selectionPattern))
+            {
+                var selection = (SelectionPattern)selectionPattern;
+                var selected = selection.Current.GetSelection();
+                if (selected.Length > 0)
+                {
+                    return selected[0].Current.Name;
+                }
+            }
+
+            return element.Current.Name ?? string.Empty;
+        }
+
+        private static bool TrySetUiaValue(AutomationElement element, string value, out string? message)
+        {
+            message = null;
+
+            if (element.TryGetCurrentPattern(ValuePattern.Pattern, out var valuePattern))
+            {
+                var pattern = (ValuePattern)valuePattern;
+                if (pattern.Current.IsReadOnly)
+                {
+                    message = "Value is read-only.";
+                    return false;
+                }
+
+                pattern.SetValue(value);
+                return true;
+            }
+
+            if (element.TryGetCurrentPattern(TogglePattern.Pattern, out var togglePattern))
+            {
+                if (!TryParseBool(value, out var boolValue))
+                {
+                    message = "Expected a boolean value (true/false).";
+                    return false;
+                }
+
+                var pattern = (TogglePattern)togglePattern;
+                var desired = boolValue ? ToggleState.On : ToggleState.Off;
+                if (pattern.Current.ToggleState != desired)
+                {
+                    pattern.Toggle();
+                }
+
+                return true;
+            }
+
+            if (element.TryGetCurrentPattern(SelectionPattern.Pattern, out var selectionPattern))
+            {
+                var selection = (SelectionPattern)selectionPattern;
+                var options = element.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
+
+                foreach (AutomationElement option in options)
+                {
+                    if (string.Equals(option.Current.Name, value, StringComparison.OrdinalIgnoreCase) &&
+                        option.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var selectionItem))
+                    {
+                        ((SelectionItemPattern)selectionItem).Select();
+                        return true;
+                    }
+                }
+
+                message = "Selection value not found.";
+                return false;
+            }
+
+            if (element.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var expandPattern))
+            {
+                var pattern = (ExpandCollapsePattern)expandPattern;
+                pattern.Expand();
+                Thread.Sleep(UiDelayMilliseconds);
+
+                var root = AutomationElement.RootElement;
+                var listItems = root.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
+
+                foreach (AutomationElement option in listItems)
+                {
+                    if (string.Equals(option.Current.Name, value, StringComparison.OrdinalIgnoreCase) &&
+                        option.TryGetCurrentPattern(SelectionItemPattern.Pattern, out var selectionItem))
+                    {
+                        ((SelectionItemPattern)selectionItem).Select();
+                        return true;
+                    }
+                }
+
+                pattern.Collapse();
+                message = "Selection value not found.";
+                return false;
+            }
+
+            message = "Unsupported value control.";
+            return false;
+        }
+
+        public void Dispose()
+        {
         }
     }
 
@@ -3520,6 +4395,15 @@ internal static class Program
             Source = source;
         }
 
+        public PropertyEntry(string name, string key, string category, object? uiValue)
+        {
+            Name = name;
+            Key = string.IsNullOrWhiteSpace(key) ? name : key;
+            Category = category;
+            UiaValue = uiValue;
+            Source = PropertySource.UiAutomation;
+        }
+
         public string Name { get; }
         public string Key { get; }
         public string Category { get; }
@@ -3531,6 +4415,8 @@ internal static class Program
         public Type? PropertyType { get; }
         public PropertySource Source { get; }
         public object? FallbackValue { get; set; }
+        public object? UiaValue { get; set; }
+        public Func<(bool Success, string? Message)>? DeleteAction { get; set; }
     }
 
     private sealed class ProjectEntry
