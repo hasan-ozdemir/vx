@@ -697,7 +697,8 @@ internal static class Program
                 return 1;
             }
 
-            var pages = GetProjectPropertyPages((object?)project);
+            var includeMsBuild = PrepareMsBuild();
+            var pages = GetProjectPropertyPages((object?)project, includeMsBuild);
             if (pages.Count == 0)
             {
                 Console.Error.WriteLine("No project properties found.");
@@ -772,7 +773,8 @@ internal static class Program
                 return 1;
             }
 
-            return RunPropertyWizardForProject(project);
+            var includeMsBuild = PrepareMsBuild();
+            return RunPropertyWizardForProject(project, includeMsBuild);
         }
         catch (COMException ex)
         {
@@ -836,9 +838,9 @@ internal static class Program
         }
     }
 
-    private static int RunPropertyWizardForProject(dynamic project)
+    private static int RunPropertyWizardForProject(dynamic project, bool includeMsBuild)
     {
-        var pages = GetProjectPropertyPages((object?)project);
+        var pages = GetProjectPropertyPages((object?)project, includeMsBuild);
         if (pages.Count == 0)
         {
             Console.WriteLine("No project properties found.");
@@ -1187,7 +1189,7 @@ internal static class Program
         "ios/Run Options"
     };
 
-    private static List<PropertyPage> GetProjectPropertyPages(object? project)
+    private static List<PropertyPage> GetProjectPropertyPages(object? project, bool includeMsBuild)
     {
         var pages = new List<PropertyPage>();
         foreach (var known in KnownPropertyPages)
@@ -1210,7 +1212,10 @@ internal static class Program
         var configProps = TryGetValue(() => (dynamic)activeConfig?.Properties);
         AddPropertyPageFromComProperties(pages, configProps);
 
-        AddPropertyPagesFromMsBuild(pages, dynamicProject);
+        if (includeMsBuild)
+        {
+            AddPropertyPagesFromMsBuild(pages, dynamicProject);
+        }
 
         foreach (var page in pages)
         {
@@ -1305,17 +1310,6 @@ internal static class Program
             return;
         }
 
-        if (!EnsureMsBuildRegistered(out var error))
-        {
-            if (!MsBuildRegistrationLogged && !string.IsNullOrWhiteSpace(error))
-            {
-                Console.Error.WriteLine($"MSBuild evaluation unavailable: {error}");
-                MsBuildRegistrationLogged = true;
-            }
-
-            return;
-        }
-
         var globalProperties = GetMsBuildGlobalProperties(project);
 
         ProjectCollection? collection = null;
@@ -1388,6 +1382,23 @@ internal static class Program
             error = ex.Message;
             return false;
         }
+    }
+
+    private static bool PrepareMsBuild()
+    {
+        if (MsBuildRegistrationAttempted)
+        {
+            return MsBuildRegistrationSucceeded;
+        }
+
+        var success = EnsureMsBuildRegistered(out var error);
+        if (!success && !MsBuildRegistrationLogged && !string.IsNullOrWhiteSpace(error))
+        {
+            Console.Error.WriteLine($"MSBuild evaluation unavailable: {error}");
+            MsBuildRegistrationLogged = true;
+        }
+
+        return success;
     }
 
     private static Dictionary<string, string> GetMsBuildGlobalProperties(dynamic project)
