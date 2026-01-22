@@ -702,7 +702,7 @@ internal static class Program
 
             foreach (var page in pages)
             {
-                Console.WriteLine($"*{page.Name}:");
+                Console.WriteLine($"*[{page.Name}]:");
                 foreach (var item in page.Items)
                 {
                     var value = SafeFormatPropertyValue(item.Property);
