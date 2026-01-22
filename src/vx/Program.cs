@@ -2169,6 +2169,11 @@ internal static class Program
     {
         try
         {
+            if (entry.Source != PropertySource.MsBuild && entry.FallbackValue != null)
+            {
+                return FormatPropertyValue(entry.FallbackValue);
+            }
+
             var value = GetPropertyValue(entry);
             return FormatPropertyValue(value);
         }
