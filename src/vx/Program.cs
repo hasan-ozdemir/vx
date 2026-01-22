@@ -2149,8 +2149,7 @@ internal static class Program
             return false;
         }
 
-        var pattern = selector.Trim();
-        var hasWildcard = pattern.Contains('*');
+        var patterns = ExpandProjectPatterns(selector);
 
         bool Match(string? candidate)
         {
@@ -2159,9 +2158,15 @@ internal static class Program
                 return false;
             }
 
-            return hasWildcard
-                ? IsWildcardMatch(candidate, pattern)
-                : string.Equals(candidate, pattern, StringComparison.OrdinalIgnoreCase);
+            foreach (var pattern in patterns)
+            {
+                if (IsWildcardMatch(candidate, pattern))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         if (Match(name) || Match(uniqueName) || Match(fullName))
@@ -2179,6 +2184,51 @@ internal static class Program
         }
 
         return false;
+    }
+
+    private static IEnumerable<string> ExpandProjectPatterns(string selector)
+    {
+        var patterns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var trimmed = selector.Trim();
+        if (string.IsNullOrWhiteSpace(trimmed))
+        {
+            return patterns;
+        }
+
+        void Add(string value)
+        {
+            if (!string.IsNullOrWhiteSpace(value))
+            {
+                patterns.Add(value);
+            }
+        }
+
+        Add(trimmed);
+
+        if (trimmed.Contains('*'))
+        {
+            if (!trimmed.StartsWith("*", StringComparison.Ordinal))
+            {
+                Add("*" + trimmed);
+            }
+
+            if (!trimmed.EndsWith("*", StringComparison.Ordinal))
+            {
+                Add(trimmed + "*");
+            }
+
+            var core = trimmed.Trim('*').Trim();
+            if (!string.IsNullOrWhiteSpace(core))
+            {
+                Add("*" + core + "*");
+            }
+        }
+        else
+        {
+            Add("*" + trimmed + "*");
+        }
+
+        return patterns;
     }
 
     private static bool IsWildcardMatch(string input, string pattern)
