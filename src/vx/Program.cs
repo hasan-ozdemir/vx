@@ -64,6 +64,11 @@ internal static class Program
                 return RunStartups(args.Skip(1).ToArray());
             case "props":
                 return RunProps(args.Skip(1).ToArray());
+            case "ios:mf":
+                return RunManifest("ios", args.Skip(1).ToArray());
+            case "droid:mf":
+            case "android:mf":
+                return RunManifest("android", args.Skip(1).ToArray());
             default:
                 Console.Error.WriteLine($"Unknown command: {args[0]}");
                 PrintHelp();
@@ -102,6 +107,10 @@ internal static class Program
         Console.WriteLine("  vx startups !pattern1;!pattern2");
         Console.WriteLine("  vx props list !projectPattern");
         Console.WriteLine("  vx props set [!projectPattern]");
+        Console.WriteLine("  vx ios:mf list [!projectPattern]");
+        Console.WriteLine("  vx ios:mf set [!projectPattern]");
+        Console.WriteLine("  vx droid:mf list [!projectPattern]");
+        Console.WriteLine("  vx droid:mf set [!projectPattern]");
         Console.WriteLine("  vx !ProjectName:build|rebuild|clean|deploy");
         Console.WriteLine();
         Console.WriteLine("Commands:");
@@ -116,6 +125,8 @@ internal static class Program
         Console.WriteLine("  startup Set the startup project.");
         Console.WriteLine("  startups Set multiple startup projects.");
         Console.WriteLine("  props  List or edit project properties.");
+        Console.WriteLine("  ios:mf List or edit iOS Info.plist manifest.");
+        Console.WriteLine("  droid:mf List or edit AndroidManifest.xml.");
     }
 
     private static int RunInfo(string[] args)
@@ -661,6 +672,63 @@ internal static class Program
         return RunPropertyWizard(selector);
     }
 
+    private static int RunManifest(string platform, string[] args)
+    {
+        if (args.Length == 0)
+        {
+            PrintManifestUsage(platform);
+            return 1;
+        }
+
+        var subCommand = args[0].Trim();
+        if (string.Equals(subCommand, "list", StringComparison.OrdinalIgnoreCase))
+        {
+            return RunManifestList(platform, args.Skip(1).ToArray());
+        }
+
+        if (string.Equals(subCommand, "set", StringComparison.OrdinalIgnoreCase))
+        {
+            return RunManifestSet(platform, args.Skip(1).ToArray());
+        }
+
+        PrintManifestUsage(platform);
+        return 1;
+    }
+
+    private static void PrintManifestUsage(string platform)
+    {
+        if (string.Equals(platform, "ios", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.Error.WriteLine("Usage: vx ios:mf list [!projectPattern] | vx ios:mf set [!projectPattern]");
+        }
+        else
+        {
+            Console.Error.WriteLine("Usage: vx droid:mf list [!projectPattern] | vx droid:mf set [!projectPattern]");
+        }
+    }
+
+    private static int RunManifestList(string platform, string[] args)
+    {
+        string? selector = null;
+        if (args.Length > 0)
+        {
+            selector = NormalizeProjectSelector(string.Join(" ", args));
+        }
+
+        return ListManifestProperties(platform, selector);
+    }
+
+    private static int RunManifestSet(string platform, string[] args)
+    {
+        string? selector = null;
+        if (args.Length > 0)
+        {
+            selector = NormalizeProjectSelector(string.Join(" ", args));
+        }
+
+        return RunManifestWizard(platform, selector);
+    }
+
     private static string NormalizeProjectSelector(string raw)
     {
         if (string.IsNullOrWhiteSpace(raw))
@@ -817,6 +885,197 @@ internal static class Program
         }
     }
 
+    private static int ListManifestProperties(string platform, string? selector)
+    {
+        var instances = VsRot.GetRunningDteInstances();
+        try
+        {
+            OleMessageFilter.Register();
+            if (!EnsureVsInstanceAvailable(instances))
+            {
+                return 1;
+            }
+
+            var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
+            if (target.Dte == null)
+            {
+                Console.Error.WriteLine("Failed to access running Visual Studio instance.");
+                return 1;
+            }
+
+            dynamic dte = target.Dte;
+            var solution = TryGetValue(() => (dynamic)dte.Solution);
+            if (solution == null || !TryGetValue(() => (bool)solution.IsOpen, false))
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            var project = ResolveManifestProject(solution, platform, selector);
+            if (project == null)
+            {
+                Console.Error.WriteLine(string.IsNullOrWhiteSpace(selector)
+                    ? $"No {platform} project found in the active solution."
+                    : $"Project not found: {selector}");
+                return 1;
+            }
+
+            var includeMsBuild = PrepareMsBuild();
+            var pages = GetManifestPropertyPages((object?)project, platform, includeMsBuild, out var manifestPath, out var error);
+            if (!string.IsNullOrWhiteSpace(error))
+            {
+                Console.Error.WriteLine(error);
+                return 1;
+            }
+
+            if (pages.Count == 0)
+            {
+                Console.Error.WriteLine("No manifest properties found.");
+                return 1;
+            }
+
+            foreach (var page in pages.Where(p => p.Items.Count > 0))
+            {
+                Console.WriteLine($"*[{page.Name}]:");
+                foreach (var item in page.Items)
+                {
+                    var value = SafeFormatPropertyValue(item);
+                    Console.WriteLine($"-{item.Name}: {value}");
+                }
+            }
+
+            return 0;
+        }
+        catch (COMException ex)
+        {
+            Console.Error.WriteLine($"Visual Studio automation error: {ex.Message}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unexpected error: {FormatUnexpectedError(ex)}");
+            return 1;
+        }
+        finally
+        {
+            OleMessageFilter.Revoke();
+            VsRot.ReleaseInstances(instances);
+        }
+    }
+
+    private static int RunManifestWizard(string platform, string? selector)
+    {
+        var instances = VsRot.GetRunningDteInstances();
+        try
+        {
+            OleMessageFilter.Register();
+            if (!EnsureVsInstanceAvailable(instances))
+            {
+                return 1;
+            }
+
+            var target = VsSelector.GetActiveInstance(instances) ?? instances[0];
+            if (target.Dte == null)
+            {
+                Console.Error.WriteLine("Failed to access running Visual Studio instance.");
+                return 1;
+            }
+
+            dynamic dte = target.Dte;
+            var solution = TryGetValue(() => (dynamic)dte.Solution);
+            if (solution == null || !TryGetValue(() => (bool)solution.IsOpen, false))
+            {
+                Console.Error.WriteLine("No solution is open in the active Visual Studio instance.");
+                return 1;
+            }
+
+            var project = ResolveManifestProject(solution, platform, selector);
+            if (project == null)
+            {
+                Console.Error.WriteLine(string.IsNullOrWhiteSpace(selector)
+                    ? $"No {platform} project found in the active solution."
+                    : $"Project not found: {selector}");
+                return 1;
+            }
+
+            var includeMsBuild = PrepareMsBuild();
+            var pages = GetManifestPropertyPages((object?)project, platform, includeMsBuild, out _, out var error);
+            if (!string.IsNullOrWhiteSpace(error))
+            {
+                Console.Error.WriteLine(error);
+                return 1;
+            }
+
+            return RunPropertyWizardForPages(pages);
+        }
+        catch (COMException ex)
+        {
+            Console.Error.WriteLine($"Visual Studio automation error: {ex.Message}");
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Unexpected error: {FormatUnexpectedError(ex)}");
+            return 1;
+        }
+        finally
+        {
+            OleMessageFilter.Revoke();
+            VsRot.ReleaseInstances(instances);
+        }
+    }
+
+    private static int RunPropertyWizardForPages(List<PropertyPage> pages)
+    {
+        if (pages.Count == 0)
+        {
+            Console.WriteLine("No properties found.");
+            return 1;
+        }
+
+        pages = pages.Where(p => p.Items.Count > 0).ToList();
+        if (pages.Count == 0)
+        {
+            Console.WriteLine("No properties found.");
+            return 1;
+        }
+
+        while (true)
+        {
+            Console.WriteLine("*select a manifest page:");
+            for (var i = 0; i < pages.Count; i++)
+            {
+                Console.WriteLine($"{i + 1}. {pages[i].Name}");
+            }
+
+            Console.Write("Select page (b to go back, q to quit): ");
+            var input = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                continue;
+            }
+
+            if (IsQuit(input))
+            {
+                return 0;
+            }
+
+            if (IsBack(input))
+            {
+                return 0;
+            }
+
+            if (!int.TryParse(input, out var pageIndex) || pageIndex < 1 || pageIndex > pages.Count)
+            {
+                Console.WriteLine("Invalid selection.");
+                continue;
+            }
+
+            var page = pages[pageIndex - 1];
+            RunPropertyWizardForPage(page, null);
+        }
+    }
+
     private static dynamic? SelectProjectInteractively(dynamic solution)
     {
         var projectCollection = TryGetValue(() => (object?)solution.Projects);
@@ -836,6 +1095,114 @@ internal static class Program
         while (true)
         {
             Console.WriteLine("*select a project:");
+            for (var i = 0; i < projects.Count; i++)
+            {
+                Console.WriteLine($"{i + 1}. {projects[i].DisplayName}");
+            }
+
+            Console.Write("Select project (q to quit): ");
+            var input = Console.ReadLine()?.Trim();
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                continue;
+            }
+
+            if (IsQuit(input))
+            {
+                return null;
+            }
+
+            if (int.TryParse(input, out var index) && index > 0 && index <= projects.Count)
+            {
+                return projects[index - 1].Project;
+            }
+
+            Console.WriteLine("Invalid selection.");
+        }
+    }
+
+    private static dynamic? ResolveManifestProject(dynamic solution, string platform, string? selector)
+    {
+        if (!string.IsNullOrWhiteSpace(selector))
+        {
+            return FindProjectBySelector(solution, selector);
+        }
+
+        var candidates = FindProjectsByPlatform(solution, platform).ToList();
+        if (candidates.Count == 0)
+        {
+            return null;
+        }
+
+        if (candidates.Count == 1)
+        {
+            return candidates[0].Project;
+        }
+
+        return SelectProjectInteractivelyFromList(candidates, $"select a {platform} project:");
+    }
+
+    private static List<ProjectEntry> FindProjectsByPlatform(dynamic solution, string platform)
+    {
+        var projectCollection = TryGetValue(() => (object?)solution.Projects);
+        var projects = EnumerateProjects(projectCollection)
+            .Select(project => new ProjectEntry(project,
+                TryGetValue(() => (string?)project.Name) ?? "(unknown)",
+                TryGetValue(() => (string?)project.UniqueName)))
+            .Where(entry => ProjectMatchesPlatform(entry.Project, platform))
+            .OrderBy(entry => entry.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        return projects;
+    }
+
+    private static bool ProjectMatchesPlatform(dynamic project, string platform)
+    {
+        var projectPath = GetProjectPath(project);
+        var fileValues = new Dictionary<string, (string Value, string FilePath)>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(projectPath) && File.Exists(projectPath))
+        {
+            fileValues = CollectPropertyValuesFromProjectFiles(projectPath);
+        }
+
+        var tfms = GetProjectTargetFrameworks((object?)project, fileValues);
+        if (tfms.Count == 0)
+        {
+            return false;
+        }
+
+        return tfms.Any(tfm =>
+        {
+            if (string.IsNullOrWhiteSpace(tfm))
+            {
+                return false;
+            }
+
+            if (string.Equals(platform, "ios", StringComparison.OrdinalIgnoreCase))
+            {
+                return tfm.Contains("ios", StringComparison.OrdinalIgnoreCase);
+            }
+
+            if (string.Equals(platform, "android", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(platform, "droid", StringComparison.OrdinalIgnoreCase))
+            {
+                return tfm.Contains("android", StringComparison.OrdinalIgnoreCase);
+            }
+
+            return false;
+        });
+    }
+
+    private static dynamic? SelectProjectInteractivelyFromList(List<ProjectEntry> projects, string title)
+    {
+        if (projects.Count == 0)
+        {
+            return null;
+        }
+
+        while (true)
+        {
+            Console.WriteLine($"*{title}");
             for (var i = 0; i < projects.Count; i++)
             {
                 Console.WriteLine($"{i + 1}. {projects[i].DisplayName}");
@@ -1591,6 +1958,1129 @@ internal static class Program
 
         msbuildEvaluation?.Dispose();
         return ordered;
+    }
+
+    private static List<PropertyPage> GetManifestPropertyPages(object? project, string platform, bool includeMsBuild, out string? manifestPath, out string? error)
+    {
+        manifestPath = null;
+        error = null;
+
+        dynamic? dynamicProject = project;
+        var projectPath = GetProjectPath(dynamicProject);
+        var fileValues = new Dictionary<string, (string Value, string FilePath)>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(projectPath) && File.Exists(projectPath))
+        {
+            fileValues = CollectPropertyValuesFromProjectFiles(projectPath);
+        }
+
+        var globalProperties = GetMsBuildGlobalProperties(dynamicProject);
+        var targetFrameworks = GetProjectTargetFrameworks(project, fileValues);
+        var targetFramework = SelectTargetFrameworkForPlatform(targetFrameworks, platform);
+        if (!string.IsNullOrWhiteSpace(targetFramework))
+        {
+            globalProperties["TargetFramework"] = targetFramework;
+        }
+
+        MsBuildEvaluation? msbuildEvaluation = null;
+        if (includeMsBuild)
+        {
+            msbuildEvaluation = TryCreateMsBuildEvaluation(dynamicProject, globalProperties);
+        }
+
+        manifestPath = ResolveManifestPath(platform, projectPath, fileValues, msbuildEvaluation);
+        msbuildEvaluation?.Dispose();
+
+        if (string.IsNullOrWhiteSpace(manifestPath))
+        {
+            error = platform.Equals("ios", StringComparison.OrdinalIgnoreCase)
+                ? "Info.plist not found for the selected project."
+                : "AndroidManifest.xml not found for the selected project.";
+            return new List<PropertyPage>();
+        }
+
+        if (platform.Equals("ios", StringComparison.OrdinalIgnoreCase))
+        {
+            return BuildIosManifestPages(manifestPath, out error);
+        }
+
+        return BuildAndroidManifestPages(manifestPath, out error);
+    }
+
+    private static string? SelectTargetFrameworkForPlatform(List<string> targetFrameworks, string platform)
+    {
+        if (targetFrameworks.Count == 0)
+        {
+            return null;
+        }
+
+        if (string.Equals(platform, "ios", StringComparison.OrdinalIgnoreCase))
+        {
+            return targetFrameworks.FirstOrDefault(tfm => tfm.Contains("ios", StringComparison.OrdinalIgnoreCase))
+                   ?? targetFrameworks.FirstOrDefault();
+        }
+
+        if (string.Equals(platform, "android", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(platform, "droid", StringComparison.OrdinalIgnoreCase))
+        {
+            return targetFrameworks.FirstOrDefault(tfm => tfm.Contains("android", StringComparison.OrdinalIgnoreCase))
+                   ?? targetFrameworks.FirstOrDefault();
+        }
+
+        return targetFrameworks.FirstOrDefault();
+    }
+
+    private static string? ResolveManifestPath(
+        string platform,
+        string? projectPath,
+        Dictionary<string, (string Value, string FilePath)> fileValues,
+        MsBuildEvaluation? msbuildEvaluation)
+    {
+        if (string.IsNullOrWhiteSpace(projectPath) || !File.Exists(projectPath))
+        {
+            return null;
+        }
+
+        var projectDir = Path.GetDirectoryName(projectPath) ?? string.Empty;
+        string? candidate = null;
+
+        if (platform.Equals("ios", StringComparison.OrdinalIgnoreCase))
+        {
+            candidate = ResolveManifestPathFromProperty("InfoPlist", projectDir, fileValues, msbuildEvaluation)
+                ?? ResolveManifestPathFromProperty("ApplicationManifest", projectDir, fileValues, msbuildEvaluation)
+                ?? ResolveManifestPathFromProperty("AppManifest", projectDir, fileValues, msbuildEvaluation)
+                ?? ResolveManifestPathFromProperty("IosAppManifest", projectDir, fileValues, msbuildEvaluation);
+
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                candidate = FindManifestPathInProject(projectPath, "Info.plist");
+            }
+
+            candidate ??= FindFirstExistingPath(projectDir, new[]
+            {
+                Path.Combine("Platforms", "iOS", "Info.plist"),
+                Path.Combine("Platforms", "ios", "Info.plist"),
+                Path.Combine("Properties", "Info.plist"),
+                "Info.plist"
+            });
+        }
+        else
+        {
+            candidate = ResolveManifestPathFromProperty("AndroidManifest", projectDir, fileValues, msbuildEvaluation)
+                ?? ResolveManifestPathFromProperty("ApplicationManifest", projectDir, fileValues, msbuildEvaluation);
+
+            if (string.IsNullOrWhiteSpace(candidate))
+            {
+                candidate = FindManifestPathInProject(projectPath, "AndroidManifest.xml");
+            }
+
+            candidate ??= FindFirstExistingPath(projectDir, new[]
+            {
+                Path.Combine("Platforms", "Android", "AndroidManifest.xml"),
+                Path.Combine("Properties", "AndroidManifest.xml"),
+                "AndroidManifest.xml"
+            });
+        }
+
+        return candidate;
+    }
+
+    private static string? ResolveManifestPathFromProperty(
+        string propertyName,
+        string projectDir,
+        Dictionary<string, (string Value, string FilePath)> fileValues,
+        MsBuildEvaluation? msbuildEvaluation)
+    {
+        if (msbuildEvaluation != null)
+        {
+            var value = msbuildEvaluation.Project.GetPropertyValue(propertyName);
+            var resolved = ResolveManifestCandidate(value, projectDir);
+            if (!string.IsNullOrWhiteSpace(resolved))
+            {
+                return resolved;
+            }
+        }
+
+        if (fileValues.TryGetValue(propertyName, out var fileValue))
+        {
+            return ResolveManifestCandidate(fileValue.Value, projectDir);
+        }
+
+        return null;
+    }
+
+    private static string? ResolveManifestCandidate(string? value, string projectDir)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return null;
+        }
+
+        var trimmed = value.Trim();
+        var path = Path.IsPathRooted(trimmed) ? trimmed : Path.Combine(projectDir, trimmed);
+        if (File.Exists(path))
+        {
+            return path;
+        }
+
+        return null;
+    }
+
+    private static string? FindManifestPathInProject(string projectPath, string fileName)
+    {
+        try
+        {
+            var root = ProjectRootElement.Open(projectPath);
+            foreach (var item in root.Items)
+            {
+                var include = item.Include;
+                if (string.IsNullOrWhiteSpace(include))
+                {
+                    continue;
+                }
+
+                if (include.EndsWith(fileName, StringComparison.OrdinalIgnoreCase))
+                {
+                    var projectDir = Path.GetDirectoryName(projectPath) ?? string.Empty;
+                    var candidate = Path.IsPathRooted(include) ? include : Path.Combine(projectDir, include);
+                    if (File.Exists(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static string? FindFirstExistingPath(string projectDir, IEnumerable<string> relativePaths)
+    {
+        foreach (var relative in relativePaths)
+        {
+            var candidate = Path.Combine(projectDir, relative);
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return null;
+    }
+
+    private static List<PropertyPage> BuildIosManifestPages(string manifestPath, out string? error)
+    {
+        error = null;
+
+        try
+        {
+            var entries = ReadPlistEntries(manifestPath, out error);
+            if (!string.IsNullOrWhiteSpace(error))
+            {
+                return new List<PropertyPage>();
+            }
+
+            var page = new PropertyPage("ios/Manifest", new List<PropertyEntry>());
+            foreach (var entry in entries)
+            {
+                var key = entry.Key;
+                var valueKind = entry.Kind;
+                object? cachedValue = entry.Value;
+                var description = DescribePlistKind(valueKind);
+
+                Action<object?> setter = newValue =>
+                {
+                    if (!TrySetPlistValue(manifestPath, key, newValue, valueKind, out var message))
+                    {
+                        throw new InvalidOperationException(message ?? "Failed to update Info.plist.");
+                    }
+
+                    cachedValue = newValue;
+                };
+
+                Func<object?> getter = () => cachedValue;
+                var entryItem = new PropertyEntry(key, key, page.Name, getter, setter, GetPlistClrType(valueKind), PropertySource.MsBuild)
+                {
+                    Description = description
+                };
+
+                entryItem.DeleteAction = () =>
+                {
+                    var success = RemovePlistKey(manifestPath, key, out var message);
+                    if (success)
+                    {
+                        cachedValue = null;
+                    }
+
+                    return (success, message);
+                };
+
+                page.Items.Add(entryItem);
+            }
+
+            return new List<PropertyPage> { page };
+        }
+        catch (Exception ex)
+        {
+            error = $"Failed to read Info.plist: {ex.Message}";
+            return new List<PropertyPage>();
+        }
+    }
+
+    private static List<PropertyPage> BuildAndroidManifestPages(string manifestPath, out string? error)
+    {
+        error = null;
+
+        try
+        {
+            var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+            var manifest = doc.Root;
+            if (manifest == null || !string.Equals(manifest.Name.LocalName, "manifest", StringComparison.OrdinalIgnoreCase))
+            {
+                error = "AndroidManifest.xml root element not found.";
+                return new List<PropertyPage>();
+            }
+
+            var pages = new List<PropertyPage>();
+            var androidNs = XNamespace.Get("http://schemas.android.com/apk/res/android");
+
+            var manifestPage = new PropertyPage("droid/Manifest", new List<PropertyEntry>());
+            manifestPage.Items.AddRange(BuildAndroidAttributeEntries(manifestPath, "manifest", manifest, androidNs));
+            pages.Add(manifestPage);
+
+            var appElement = manifest.Elements().FirstOrDefault(el => string.Equals(el.Name.LocalName, "application", StringComparison.OrdinalIgnoreCase));
+            if (appElement != null)
+            {
+                var appPage = new PropertyPage("droid/Application", new List<PropertyEntry>());
+                appPage.Items.AddRange(BuildAndroidAttributeEntries(manifestPath, "application", appElement, androidNs));
+                pages.Add(appPage);
+            }
+
+            var sdkElement = manifest.Elements().FirstOrDefault(el => string.Equals(el.Name.LocalName, "uses-sdk", StringComparison.OrdinalIgnoreCase));
+            var sdkPage = new PropertyPage("droid/SDK", new List<PropertyEntry>());
+            sdkPage.Items.AddRange(BuildAndroidSdkEntries(manifestPath, androidNs, sdkElement));
+            if (sdkPage.Items.Count > 0)
+            {
+                pages.Add(sdkPage);
+            }
+
+            var permissionsPage = new PropertyPage("droid/Permissions", new List<PropertyEntry>());
+            permissionsPage.Items.Add(BuildAndroidListEntry(
+                manifestPath,
+                "Uses Permissions",
+                "uses-permission",
+                "droid/Permissions",
+                manifest,
+                androidNs,
+                "uses-permission",
+                "name"));
+            pages.Add(permissionsPage);
+
+            var featuresPage = new PropertyPage("droid/Features", new List<PropertyEntry>());
+            featuresPage.Items.Add(BuildAndroidListEntry(
+                manifestPath,
+                "Uses Features",
+                "uses-feature",
+                "droid/Features",
+                manifest,
+                androidNs,
+                "uses-feature",
+                "name"));
+            pages.Add(featuresPage);
+
+            return pages;
+        }
+        catch (Exception ex)
+        {
+            error = $"Failed to read AndroidManifest.xml: {ex.Message}";
+            return new List<PropertyPage>();
+        }
+    }
+
+    private static List<PropertyEntry> BuildAndroidAttributeEntries(string manifestPath, string elementName, XElement element, XNamespace androidNs)
+    {
+        var entries = new List<PropertyEntry>();
+        foreach (var attribute in element.Attributes())
+        {
+            if (attribute.IsNamespaceDeclaration)
+            {
+                continue;
+            }
+
+            var name = attribute.Name.NamespaceName == androidNs.NamespaceName
+                ? $"android:{attribute.Name.LocalName}"
+                : attribute.Name.LocalName;
+
+            object? cachedValue = attribute.Value;
+            var propertyType = TryParseBool(attribute.Value, out _) ? typeof(bool) : typeof(string);
+
+            Action<object?> setter = newValue =>
+            {
+                var textValue = newValue?.ToString() ?? string.Empty;
+                SetAndroidAttribute(manifestPath, elementName, attribute.Name, textValue, androidNs);
+                cachedValue = textValue;
+            };
+
+            Func<object?> getter = () => cachedValue;
+            var entry = new PropertyEntry(name, name, elementName, getter, setter, propertyType, PropertySource.MsBuild)
+            {
+                Description = $"{elementName} attribute"
+            };
+
+            entry.DeleteAction = () =>
+            {
+                var success = RemoveAndroidAttribute(manifestPath, elementName, attribute.Name, androidNs, out var message);
+                if (success)
+                {
+                    cachedValue = null;
+                }
+
+                return (success, message);
+            };
+
+            entries.Add(entry);
+        }
+
+        return entries;
+    }
+
+    private static List<PropertyEntry> BuildAndroidSdkEntries(string manifestPath, XNamespace androidNs, XElement? sdkElement)
+    {
+        var entries = new List<PropertyEntry>();
+        var sdkAttributes = new[] { "minSdkVersion", "targetSdkVersion", "maxSdkVersion" };
+
+        foreach (var attrName in sdkAttributes)
+        {
+            var xname = androidNs + attrName;
+            object? cachedValue = sdkElement?.Attribute(xname)?.Value;
+
+            Action<object?> setter = newValue =>
+            {
+                var textValue = newValue?.ToString() ?? string.Empty;
+                SetAndroidSdkAttribute(manifestPath, xname, textValue, androidNs);
+                cachedValue = textValue;
+            };
+
+            Func<object?> getter = () => cachedValue;
+            var entry = new PropertyEntry($"android:{attrName}", $"android:{attrName}", "droid/SDK", getter, setter, typeof(string), PropertySource.MsBuild)
+            {
+                Description = "uses-sdk attribute"
+            };
+
+            entry.DeleteAction = () =>
+            {
+                var success = RemoveAndroidSdkAttribute(manifestPath, xname, androidNs, out var message);
+                if (success)
+                {
+                    cachedValue = null;
+                }
+
+                return (success, message);
+            };
+
+            entries.Add(entry);
+        }
+
+        return entries;
+    }
+
+    private static PropertyEntry BuildAndroidListEntry(
+        string manifestPath,
+        string displayName,
+        string key,
+        string pageName,
+        XElement manifest,
+        XNamespace androidNs,
+        string elementName,
+        string attributeName)
+    {
+        object? cachedValue = GetAndroidListValue(manifest, androidNs, elementName, attributeName);
+        Action<object?> setter = newValue =>
+        {
+            var textValue = newValue?.ToString() ?? string.Empty;
+            SetAndroidListValue(manifestPath, androidNs, elementName, attributeName, textValue);
+            cachedValue = textValue;
+        };
+
+        Func<object?> getter = () => cachedValue;
+        return new PropertyEntry(displayName, key, pageName, getter, setter, typeof(string), PropertySource.MsBuild)
+        {
+            Description = $"Semicolon-separated list for {elementName}"
+        };
+    }
+
+    private static void SetAndroidAttribute(string manifestPath, string elementName, XName attributeName, string value, XNamespace androidNs)
+    {
+        var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+        var manifest = doc.Root;
+        if (manifest == null)
+        {
+            throw new InvalidOperationException("AndroidManifest.xml root element not found.");
+        }
+
+        XElement? target = manifest;
+        if (!string.Equals(elementName, "manifest", StringComparison.OrdinalIgnoreCase))
+        {
+            target = manifest.Elements().FirstOrDefault(el => string.Equals(el.Name.LocalName, elementName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        if (target == null)
+        {
+            throw new InvalidOperationException($"Element '{elementName}' not found.");
+        }
+
+        target.SetAttributeValue(attributeName, value);
+        doc.Save(manifestPath);
+    }
+
+    private static bool RemoveAndroidAttribute(string manifestPath, string elementName, XName attributeName, XNamespace androidNs, out string? message)
+    {
+        message = null;
+
+        try
+        {
+            var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+            var manifest = doc.Root;
+            if (manifest == null)
+            {
+                message = "AndroidManifest.xml root element not found.";
+                return false;
+            }
+
+            XElement? target = manifest;
+            if (!string.Equals(elementName, "manifest", StringComparison.OrdinalIgnoreCase))
+            {
+                target = manifest.Elements().FirstOrDefault(el => string.Equals(el.Name.LocalName, elementName, StringComparison.OrdinalIgnoreCase));
+            }
+
+            if (target == null)
+            {
+                message = $"Element '{elementName}' not found.";
+                return false;
+            }
+
+            var attr = target.Attribute(attributeName);
+            if (attr == null)
+            {
+                message = "Attribute not found.";
+                return false;
+            }
+
+            attr.Remove();
+            doc.Save(manifestPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            message = ex.Message;
+            return false;
+        }
+    }
+
+    private static void SetAndroidSdkAttribute(string manifestPath, XName attributeName, string value, XNamespace androidNs)
+    {
+        var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+        var manifest = doc.Root;
+        if (manifest == null)
+        {
+            throw new InvalidOperationException("AndroidManifest.xml root element not found.");
+        }
+
+        var sdk = manifest.Elements().FirstOrDefault(el => string.Equals(el.Name.LocalName, "uses-sdk", StringComparison.OrdinalIgnoreCase));
+        if (sdk == null)
+        {
+            sdk = new XElement("uses-sdk");
+            manifest.AddFirst(sdk);
+        }
+
+        sdk.SetAttributeValue(attributeName, value);
+        doc.Save(manifestPath);
+    }
+
+    private static bool RemoveAndroidSdkAttribute(string manifestPath, XName attributeName, XNamespace androidNs, out string? message)
+    {
+        message = null;
+
+        try
+        {
+            var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+            var manifest = doc.Root;
+            if (manifest == null)
+            {
+                message = "AndroidManifest.xml root element not found.";
+                return false;
+            }
+
+            var sdk = manifest.Elements().FirstOrDefault(el => string.Equals(el.Name.LocalName, "uses-sdk", StringComparison.OrdinalIgnoreCase));
+            if (sdk == null)
+            {
+                message = "uses-sdk element not found.";
+                return false;
+            }
+
+            var attr = sdk.Attribute(attributeName);
+            if (attr == null)
+            {
+                message = "Attribute not found.";
+                return false;
+            }
+
+            attr.Remove();
+            doc.Save(manifestPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            message = ex.Message;
+            return false;
+        }
+    }
+
+    private static string GetAndroidListValue(XElement manifest, XNamespace androidNs, string elementName, string attributeName)
+    {
+        var values = manifest.Elements()
+            .Where(el => string.Equals(el.Name.LocalName, elementName, StringComparison.OrdinalIgnoreCase))
+            .Select(el => el.Attribute(androidNs + attributeName)?.Value)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .ToList();
+
+        return string.Join("; ", values);
+    }
+
+    private static void SetAndroidListValue(string manifestPath, XNamespace androidNs, string elementName, string attributeName, string value)
+    {
+        var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+        var manifest = doc.Root;
+        if (manifest == null)
+        {
+            throw new InvalidOperationException("AndroidManifest.xml root element not found.");
+        }
+
+        var items = SplitManifestList(value);
+        var existing = manifest.Elements().Where(el => string.Equals(el.Name.LocalName, elementName, StringComparison.OrdinalIgnoreCase)).ToList();
+        foreach (var node in existing)
+        {
+            node.Remove();
+        }
+
+        foreach (var item in items)
+        {
+            var element = new XElement(elementName);
+            element.SetAttributeValue(androidNs + attributeName, item);
+            manifest.Add(element);
+        }
+
+        doc.Save(manifestPath);
+    }
+
+    private static List<string> SplitManifestList(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return new List<string>();
+        }
+
+        return value
+            .Split(new[] { ';', ',', '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries)
+            .Select(item => item.Trim())
+            .Where(item => !string.IsNullOrWhiteSpace(item))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private sealed class PlistEntry
+    {
+        public string Key { get; set; } = string.Empty;
+        public object? Value { get; set; }
+        public PlistValueKind Kind { get; set; }
+    }
+
+    private enum PlistValueKind
+    {
+        String,
+        Integer,
+        Real,
+        Boolean,
+        Date,
+        Data,
+        Array,
+        Dictionary,
+        Unknown
+    }
+
+    private static List<PlistEntry> ReadPlistEntries(string manifestPath, out string? error)
+    {
+        error = null;
+        var entries = new List<PlistEntry>();
+
+        var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+        var dict = doc.Root?.Elements().FirstOrDefault(el => string.Equals(el.Name.LocalName, "dict", StringComparison.OrdinalIgnoreCase))
+                   ?? doc.Descendants().FirstOrDefault(el => string.Equals(el.Name.LocalName, "dict", StringComparison.OrdinalIgnoreCase));
+        if (dict == null)
+        {
+            error = "Info.plist dictionary root not found.";
+            return entries;
+        }
+
+        var elements = dict.Elements().ToList();
+        for (var i = 0; i < elements.Count; i++)
+        {
+            var element = elements[i];
+            if (!string.Equals(element.Name.LocalName, "key", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var key = element.Value?.Trim();
+            if (string.IsNullOrWhiteSpace(key))
+            {
+                continue;
+            }
+
+            if (i + 1 >= elements.Count)
+            {
+                continue;
+            }
+
+            var valueElement = elements[i + 1];
+            var value = ParsePlistValueElement(valueElement, out var kind);
+            entries.Add(new PlistEntry
+            {
+                Key = key,
+                Value = value,
+                Kind = kind
+            });
+        }
+
+        return entries;
+    }
+
+    private static object? ParsePlistValueElement(XElement element, out PlistValueKind kind)
+    {
+        var name = element.Name.LocalName;
+        switch (name)
+        {
+            case "string":
+                kind = PlistValueKind.String;
+                return element.Value;
+            case "integer":
+                kind = PlistValueKind.Integer;
+                if (long.TryParse(element.Value, out var intValue))
+                {
+                    return intValue;
+                }
+
+                return element.Value;
+            case "real":
+                kind = PlistValueKind.Real;
+                if (double.TryParse(element.Value, out var realValue))
+                {
+                    return realValue;
+                }
+
+                return element.Value;
+            case "true":
+                kind = PlistValueKind.Boolean;
+                return true;
+            case "false":
+                kind = PlistValueKind.Boolean;
+                return false;
+            case "date":
+                kind = PlistValueKind.Date;
+                if (DateTime.TryParse(element.Value, out var dateValue))
+                {
+                    return dateValue;
+                }
+
+                return element.Value;
+            case "data":
+                kind = PlistValueKind.Data;
+                return element.Value;
+            case "array":
+                kind = PlistValueKind.Array;
+                return SerializePlistObjectToJson(ParsePlistArray(element));
+            case "dict":
+                kind = PlistValueKind.Dictionary;
+                return SerializePlistObjectToJson(ParsePlistDictionary(element));
+            default:
+                kind = PlistValueKind.Unknown;
+                return element.Value;
+        }
+    }
+
+    private static object? ParsePlistArray(XElement element)
+    {
+        var list = new List<object?>();
+        foreach (var child in element.Elements())
+        {
+            list.Add(ParsePlistValueElement(child, out _));
+        }
+
+        return list;
+    }
+
+    private static object? ParsePlistDictionary(XElement element)
+    {
+        var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+        var elements = element.Elements().ToList();
+        for (var i = 0; i < elements.Count; i++)
+        {
+            if (!string.Equals(elements[i].Name.LocalName, "key", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var key = elements[i].Value;
+            if (string.IsNullOrWhiteSpace(key) || i + 1 >= elements.Count)
+            {
+                continue;
+            }
+
+            var valueElement = elements[i + 1];
+            dict[key] = ParsePlistValueElement(valueElement, out _);
+        }
+
+        return dict;
+    }
+
+    private static string SerializePlistObjectToJson(object? value)
+    {
+        try
+        {
+            return JsonSerializer.Serialize(value);
+        }
+        catch
+        {
+            return value?.ToString() ?? string.Empty;
+        }
+    }
+
+    private static Type GetPlistClrType(PlistValueKind kind)
+    {
+        return kind switch
+        {
+            PlistValueKind.Boolean => typeof(bool),
+            PlistValueKind.Integer => typeof(long),
+            PlistValueKind.Real => typeof(double),
+            PlistValueKind.Date => typeof(DateTime),
+            _ => typeof(string)
+        };
+    }
+
+    private static string? DescribePlistKind(PlistValueKind kind)
+    {
+        return kind switch
+        {
+            PlistValueKind.Array => "JSON array",
+            PlistValueKind.Dictionary => "JSON object",
+            PlistValueKind.Data => "Base64 data",
+            PlistValueKind.Date => "ISO-8601 date",
+            _ => null
+        };
+    }
+
+    private static bool TrySetPlistValue(string manifestPath, string key, object? value, PlistValueKind kind, out string? message)
+    {
+        message = null;
+
+        try
+        {
+            var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+            var dict = doc.Root?.Elements().FirstOrDefault(el => string.Equals(el.Name.LocalName, "dict", StringComparison.OrdinalIgnoreCase))
+                       ?? doc.Descendants().FirstOrDefault(el => string.Equals(el.Name.LocalName, "dict", StringComparison.OrdinalIgnoreCase));
+            if (dict == null)
+            {
+                message = "Info.plist dictionary root not found.";
+                return false;
+            }
+
+            XElement? keyElement = null;
+            XElement? valueElement = null;
+            var elements = dict.Elements().ToList();
+            for (var i = 0; i < elements.Count; i++)
+            {
+                if (!string.Equals(elements[i].Name.LocalName, "key", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (string.Equals(elements[i].Value, key, StringComparison.OrdinalIgnoreCase))
+                {
+                    keyElement = elements[i];
+                    if (i + 1 < elements.Count)
+                    {
+                        valueElement = elements[i + 1];
+                    }
+
+                    break;
+                }
+            }
+
+            var newValueElement = CreatePlistValueElement(value, kind, out var errorMessage);
+            if (newValueElement == null)
+            {
+                message = errorMessage ?? "Invalid plist value.";
+                return false;
+            }
+
+            if (keyElement == null || valueElement == null)
+            {
+                dict.Add(new XElement("key", key));
+                dict.Add(newValueElement);
+            }
+            else
+            {
+                valueElement.ReplaceWith(newValueElement);
+            }
+
+            doc.Save(manifestPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            message = ex.Message;
+            return false;
+        }
+    }
+
+    private static XElement? CreatePlistValueElement(object? value, PlistValueKind kind, out string? error)
+    {
+        error = null;
+        try
+        {
+            if (kind == PlistValueKind.Unknown)
+            {
+                if (value is bool boolValue)
+                {
+                    return boolValue ? new XElement("true") : new XElement("false");
+                }
+
+                if (value is int or long)
+                {
+                    return new XElement("integer", value.ToString());
+                }
+
+                if (value is float or double or decimal)
+                {
+                    return new XElement("real", value.ToString());
+                }
+
+                if (value is Dictionary<string, object?> dictValue)
+                {
+                    return BuildPlistDictElement(dictValue);
+                }
+
+                if (value is List<object?> listValue)
+                {
+                    return BuildPlistArrayElement(listValue);
+                }
+            }
+
+            if (kind == PlistValueKind.Array || kind == PlistValueKind.Dictionary)
+            {
+                var jsonText = value?.ToString() ?? string.Empty;
+                if (string.IsNullOrWhiteSpace(jsonText))
+                {
+                    return kind == PlistValueKind.Array ? new XElement("array") : new XElement("dict");
+                }
+
+                if (!TryParseJson(jsonText, out var jsonValue, out var jsonError))
+                {
+                    error = jsonError ?? "Invalid JSON.";
+                    return null;
+                }
+
+                return kind == PlistValueKind.Array
+                    ? BuildPlistArrayElement(jsonValue as List<object?>)
+                    : BuildPlistDictElement(jsonValue as Dictionary<string, object?>);
+            }
+
+            if (kind == PlistValueKind.Boolean)
+            {
+                var boolValue = value is bool b ? b : TryParseBool(value?.ToString() ?? string.Empty, out var parsed) ? parsed : false;
+                return boolValue ? new XElement("true") : new XElement("false");
+            }
+
+            if (kind == PlistValueKind.Integer)
+            {
+                var textValue = value?.ToString() ?? "0";
+                return new XElement("integer", textValue);
+            }
+
+            if (kind == PlistValueKind.Real)
+            {
+                var textValue = value?.ToString() ?? "0";
+                return new XElement("real", textValue);
+            }
+
+            if (kind == PlistValueKind.Date)
+            {
+                var textValue = value is DateTime date
+                    ? date.ToString("o")
+                    : value?.ToString() ?? string.Empty;
+                return new XElement("date", textValue);
+            }
+
+            if (kind == PlistValueKind.Data)
+            {
+                return new XElement("data", value?.ToString() ?? string.Empty);
+            }
+
+            return new XElement("string", value?.ToString() ?? string.Empty);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return null;
+        }
+    }
+
+    private static XElement BuildPlistArrayElement(List<object?>? values)
+    {
+        var array = new XElement("array");
+        if (values == null)
+        {
+            return array;
+        }
+
+        foreach (var value in values)
+        {
+            array.Add(CreatePlistValueElement(value, PlistValueKind.Unknown, out _));
+        }
+
+        return array;
+    }
+
+    private static XElement BuildPlistDictElement(Dictionary<string, object?>? values)
+    {
+        var dict = new XElement("dict");
+        if (values == null)
+        {
+            return dict;
+        }
+
+        foreach (var pair in values)
+        {
+            dict.Add(new XElement("key", pair.Key));
+            dict.Add(CreatePlistValueElement(pair.Value, PlistValueKind.Unknown, out _));
+        }
+
+        return dict;
+    }
+
+    private static bool TryParseJson(string json, out object? value, out string? error)
+    {
+        value = null;
+        error = null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            value = ConvertJsonElement(doc.RootElement);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private static object? ConvertJsonElement(JsonElement element)
+    {
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.String:
+                return element.GetString();
+            case JsonValueKind.Number:
+                if (element.TryGetInt64(out var intValue))
+                {
+                    return intValue;
+                }
+
+                if (element.TryGetDouble(out var doubleValue))
+                {
+                    return doubleValue;
+                }
+
+                return element.GetRawText();
+            case JsonValueKind.True:
+                return true;
+            case JsonValueKind.False:
+                return false;
+            case JsonValueKind.Object:
+                var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                foreach (var prop in element.EnumerateObject())
+                {
+                    dict[prop.Name] = ConvertJsonElement(prop.Value);
+                }
+
+                return dict;
+            case JsonValueKind.Array:
+                var list = new List<object?>();
+                foreach (var item in element.EnumerateArray())
+                {
+                    list.Add(ConvertJsonElement(item));
+                }
+
+                return list;
+            default:
+                return null;
+        }
+    }
+
+    private static bool RemovePlistKey(string manifestPath, string key, out string? message)
+    {
+        message = null;
+
+        try
+        {
+            var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+            var dict = doc.Root?.Elements().FirstOrDefault(el => string.Equals(el.Name.LocalName, "dict", StringComparison.OrdinalIgnoreCase))
+                       ?? doc.Descendants().FirstOrDefault(el => string.Equals(el.Name.LocalName, "dict", StringComparison.OrdinalIgnoreCase));
+            if (dict == null)
+            {
+                message = "Info.plist dictionary root not found.";
+                return false;
+            }
+
+            var elements = dict.Elements().ToList();
+            for (var i = 0; i < elements.Count; i++)
+            {
+                if (!string.Equals(elements[i].Name.LocalName, "key", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (!string.Equals(elements[i].Value, key, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                var keyElement = elements[i];
+                XElement? valueElement = null;
+                if (i + 1 < elements.Count)
+                {
+                    valueElement = elements[i + 1];
+                }
+
+                keyElement.Remove();
+                valueElement?.Remove();
+                doc.Save(manifestPath);
+                return true;
+            }
+
+            message = "Key not found.";
+            return false;
+        }
+        catch (Exception ex)
+        {
+            message = ex.Message;
+            return false;
+        }
     }
 
     private static bool ShouldIncludeAllMsBuildProperties()
