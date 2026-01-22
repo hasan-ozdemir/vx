@@ -697,14 +697,14 @@ internal static class Program
                 return 1;
             }
 
-            var pages = GetProjectPropertyPages(project);
+            var pages = GetProjectPropertyPages((object?)project);
             if (pages.Count == 0)
             {
                 Console.Error.WriteLine("No project properties found.");
                 return 1;
             }
 
-            foreach (var page in pages)
+            foreach (var page in pages.Where(p => p.Items.Count > 0))
             {
                 Console.WriteLine($"*[{page.Name}]:");
                 foreach (var item in page.Items)
@@ -838,7 +838,14 @@ internal static class Program
 
     private static int RunPropertyWizardForProject(dynamic project)
     {
-        var pages = GetProjectPropertyPages(project);
+        var pages = GetProjectPropertyPages((object?)project);
+        if (pages.Count == 0)
+        {
+            Console.WriteLine("No project properties found.");
+            return 1;
+        }
+
+        pages = pages.Where(p => p.Items.Count > 0).ToList();
         if (pages.Count == 0)
         {
             Console.WriteLine("No project properties found.");
@@ -1180,7 +1187,7 @@ internal static class Program
         "ios/Run Options"
     };
 
-    private static List<PropertyPage> GetProjectPropertyPages(dynamic project)
+    private static List<PropertyPage> GetProjectPropertyPages(object? project)
     {
         var pages = new List<PropertyPage>();
         foreach (var known in KnownPropertyPages)
@@ -1188,21 +1195,22 @@ internal static class Program
             pages.Add(new PropertyPage(known, new List<PropertyEntry>()));
         }
 
-        var projectObject = TryGetValue(() => (object?)project.Object) ?? (object?)project;
+        dynamic? dynamicProject = project;
+        var projectObject = TryGetValue(() => (object?)dynamicProject?.Object) ?? project;
         AddPropertyPagesFromObject(pages, projectObject);
 
-        var configManager = TryGetValue(() => (dynamic)project.ConfigurationManager);
+        var configManager = TryGetValue(() => (dynamic)dynamicProject?.ConfigurationManager);
         var activeConfig = TryGetValue(() => (dynamic)configManager?.ActiveConfiguration);
         var configObject = TryGetValue(() => (object?)activeConfig?.Object) ?? (object?)activeConfig;
         AddPropertyPagesFromObject(pages, configObject);
 
-        var projectProps = TryGetValue(() => (dynamic)project.Properties);
+        var projectProps = TryGetValue(() => (dynamic)dynamicProject?.Properties);
         AddPropertyPageFromComProperties(pages, projectProps);
 
         var configProps = TryGetValue(() => (dynamic)activeConfig?.Properties);
         AddPropertyPageFromComProperties(pages, configProps);
 
-        AddPropertyPagesFromMsBuild(pages, project);
+        AddPropertyPagesFromMsBuild(pages, dynamicProject);
 
         foreach (var page in pages)
         {
@@ -1608,6 +1616,59 @@ internal static class Program
 
     private static string MapPropertyPageName(string category, string propertyName)
     {
+        if (!string.IsNullOrWhiteSpace(category))
+        {
+            var normalizedCategory = category.Trim();
+            foreach (var known in KnownPropertyPages)
+            {
+                if (string.Equals(known, normalizedCategory, StringComparison.OrdinalIgnoreCase))
+                {
+                    return known;
+                }
+            }
+
+            if (string.Equals(normalizedCategory, "Application", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Application/General";
+            }
+
+            if (string.Equals(normalizedCategory, "Build", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Build/General";
+            }
+
+            if (string.Equals(normalizedCategory, "Package", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Package/General";
+            }
+
+            if (string.Equals(normalizedCategory, "Code Analysis", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Code Analysis/All analyzers";
+            }
+
+            if (string.Equals(normalizedCategory, "Resources", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Resources/General";
+            }
+
+            if (string.Equals(normalizedCategory, "Global Usings", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Global Usings/General";
+            }
+
+            if (string.Equals(normalizedCategory, "MAUI Shared", StringComparison.OrdinalIgnoreCase))
+            {
+                return "MAUI Shared/General";
+            }
+
+            if (string.Equals(normalizedCategory, "iOS", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(normalizedCategory, "ios", StringComparison.OrdinalIgnoreCase))
+            {
+                return "ios/Build";
+            }
+        }
+
         var key = $"{category} {propertyName}".Trim().ToLowerInvariant();
 
         bool Contains(string value) => key.Contains(value, StringComparison.OrdinalIgnoreCase);
@@ -1762,6 +1823,11 @@ internal static class Program
             }
 
             return "ios/Build";
+        }
+
+        if (!string.IsNullOrWhiteSpace(category))
+        {
+            return NormalizePageName(category);
         }
 
         return "Application/General";
