@@ -2291,6 +2291,12 @@ internal static class Program
                 "name"));
             pages.Add(featuresPage);
 
+            var allPage = BuildAndroidAllPropertiesPage(manifestPath, doc, androidNs);
+            if (allPage.Items.Count > 0)
+            {
+                pages.Add(allPage);
+            }
+
             return pages;
         }
         catch (Exception ex)
@@ -2345,6 +2351,303 @@ internal static class Program
         }
 
         return entries;
+    }
+
+    private static PropertyPage BuildAndroidAllPropertiesPage(string manifestPath, XDocument doc, XNamespace androidNs)
+    {
+        var page = new PropertyPage("droid/All", new List<PropertyEntry>());
+        var root = doc.Root;
+        if (root == null)
+        {
+            return page;
+        }
+
+        var stack = new List<AndroidElementSegment>();
+        CollectAndroidAllProperties(manifestPath, root, androidNs, stack, page);
+        return page;
+    }
+
+    private static void CollectAndroidAllProperties(
+        string manifestPath,
+        XElement element,
+        XNamespace androidNs,
+        List<AndroidElementSegment> path,
+        PropertyPage page)
+    {
+        var segment = CreateAndroidElementSegment(element, androidNs);
+        var newPath = new List<AndroidElementSegment>(path)
+        {
+            segment
+        };
+
+        foreach (var attribute in element.Attributes())
+        {
+            if (attribute.IsNamespaceDeclaration)
+            {
+                continue;
+            }
+
+            var displayName = BuildAndroidAttributeDisplayName(newPath, attribute, androidNs);
+            var entry = CreateAndroidAttributeEntry(manifestPath, newPath, attribute.Name, displayName, androidNs, attribute.Value);
+            page.Items.Add(entry);
+        }
+
+        if (!element.HasElements && !string.IsNullOrWhiteSpace(element.Value))
+        {
+            var displayName = $"{BuildAndroidElementPath(newPath)}/#text";
+            var entry = CreateAndroidTextEntry(manifestPath, newPath, displayName, element.Value, androidNs);
+            page.Items.Add(entry);
+        }
+
+        foreach (var child in element.Elements())
+        {
+            CollectAndroidAllProperties(manifestPath, child, androidNs, newPath, page);
+        }
+    }
+
+    private static PropertyEntry CreateAndroidAttributeEntry(
+        string manifestPath,
+        List<AndroidElementSegment> path,
+        XName attributeName,
+        string displayName,
+        XNamespace androidNs,
+        string? currentValue)
+    {
+        object? cachedValue = currentValue;
+        var propertyType = TryParseBool(currentValue ?? string.Empty, out _) ? typeof(bool) : typeof(string);
+
+        Action<object?> setter = newValue =>
+        {
+            var textValue = newValue?.ToString() ?? string.Empty;
+            UpdateAndroidAttribute(manifestPath, path, attributeName, textValue, androidNs);
+            cachedValue = textValue;
+        };
+
+        Func<object?> getter = () => cachedValue;
+        var entry = new PropertyEntry(displayName, displayName, "droid/All", getter, setter, propertyType, PropertySource.MsBuild)
+        {
+            Description = "Android manifest attribute"
+        };
+
+        entry.DeleteAction = () =>
+        {
+            var success = RemoveAndroidAttribute(manifestPath, path, attributeName, androidNs, out var message);
+            if (success)
+            {
+                cachedValue = null;
+            }
+
+            return (success, message);
+        };
+
+        return entry;
+    }
+
+    private static PropertyEntry CreateAndroidTextEntry(
+        string manifestPath,
+        List<AndroidElementSegment> path,
+        string displayName,
+        string? currentValue,
+        XNamespace androidNs)
+    {
+        object? cachedValue = currentValue;
+        Action<object?> setter = newValue =>
+        {
+            var textValue = newValue?.ToString() ?? string.Empty;
+            UpdateAndroidElementText(manifestPath, path, textValue, androidNs);
+            cachedValue = textValue;
+        };
+
+        Func<object?> getter = () => cachedValue;
+        return new PropertyEntry(displayName, displayName, "droid/All", getter, setter, typeof(string), PropertySource.MsBuild)
+        {
+            Description = "Android manifest element text"
+        };
+    }
+
+    private static void UpdateAndroidAttribute(string manifestPath, List<AndroidElementSegment> path, XName attributeName, string value, XNamespace androidNs)
+    {
+        var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+        var root = doc.Root;
+        if (root == null)
+        {
+            throw new InvalidOperationException("AndroidManifest.xml root element not found.");
+        }
+
+        var target = ResolveAndroidElement(root, path, androidNs);
+        if (target == null)
+        {
+            throw new InvalidOperationException("Manifest element not found.");
+        }
+
+        target.SetAttributeValue(attributeName, value);
+        doc.Save(manifestPath);
+    }
+
+    private static bool RemoveAndroidAttribute(string manifestPath, List<AndroidElementSegment> path, XName attributeName, XNamespace androidNs, out string? message)
+    {
+        message = null;
+        try
+        {
+            var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+            var root = doc.Root;
+            if (root == null)
+            {
+                message = "AndroidManifest.xml root element not found.";
+                return false;
+            }
+
+            var target = ResolveAndroidElement(root, path, androidNs);
+            if (target == null)
+            {
+                message = "Manifest element not found.";
+                return false;
+            }
+
+            var attr = target.Attribute(attributeName);
+            if (attr == null)
+            {
+                message = "Attribute not found.";
+                return false;
+            }
+
+            attr.Remove();
+            doc.Save(manifestPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            message = ex.Message;
+            return false;
+        }
+    }
+
+    private static void UpdateAndroidElementText(string manifestPath, List<AndroidElementSegment> path, string value, XNamespace androidNs)
+    {
+        var doc = XDocument.Load(manifestPath, LoadOptions.PreserveWhitespace);
+        var root = doc.Root;
+        if (root == null)
+        {
+            throw new InvalidOperationException("AndroidManifest.xml root element not found.");
+        }
+
+        var target = ResolveAndroidElement(root, path, androidNs);
+        if (target == null)
+        {
+            throw new InvalidOperationException("Manifest element not found.");
+        }
+
+        target.Value = value;
+        doc.Save(manifestPath);
+    }
+
+    private static XElement? ResolveAndroidElement(XElement root, List<AndroidElementSegment> path, XNamespace androidNs)
+    {
+        XElement? current = root;
+        for (var i = 0; i < path.Count; i++)
+        {
+            var segment = path[i];
+            if (i == 0)
+            {
+                if (!string.Equals(current.Name.LocalName, segment.Name, StringComparison.OrdinalIgnoreCase))
+                {
+                    current = root.Descendants().FirstOrDefault(el => string.Equals(el.Name.LocalName, segment.Name, StringComparison.OrdinalIgnoreCase));
+                    if (current == null)
+                    {
+                        return null;
+                    }
+                }
+
+                continue;
+            }
+
+            if (current == null)
+            {
+                return null;
+            }
+
+            var candidates = current.Elements()
+                .Where(el => string.Equals(el.Name.LocalName, segment.Name, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (!string.IsNullOrWhiteSpace(segment.IdAttributeLocalName) &&
+                !string.IsNullOrWhiteSpace(segment.IdAttributeValue))
+            {
+                var attrName = segment.IdAttributeIsAndroid
+                    ? androidNs + segment.IdAttributeLocalName
+                    : (XName)segment.IdAttributeLocalName;
+
+                current = candidates.FirstOrDefault(el =>
+                    string.Equals(el.Attribute(attrName)?.Value, segment.IdAttributeValue, StringComparison.OrdinalIgnoreCase));
+            }
+            else
+            {
+                var index = segment.Index <= 0 ? 1 : segment.Index;
+                current = candidates.ElementAtOrDefault(index - 1);
+            }
+        }
+
+        return current;
+    }
+
+    private static string BuildAndroidAttributeDisplayName(List<AndroidElementSegment> path, XAttribute attribute, XNamespace androidNs)
+    {
+        var pathText = BuildAndroidElementPath(path);
+        var attrName = attribute.Name.NamespaceName == androidNs.NamespaceName
+            ? $"android:{attribute.Name.LocalName}"
+            : attribute.Name.LocalName;
+        return $"{pathText}/@{attrName}";
+    }
+
+    private static string BuildAndroidElementPath(List<AndroidElementSegment> path)
+    {
+        var parts = path.Select(segment => segment.ToDisplayString());
+        return string.Join("/", parts);
+    }
+
+    private static AndroidElementSegment CreateAndroidElementSegment(XElement element, XNamespace androidNs)
+    {
+        var name = element.Name.LocalName;
+        string? idAttributeLocalName = null;
+        string? idAttributeValue = null;
+        var idAttributeIsAndroid = false;
+
+        var androidName = element.Attribute(androidNs + "name");
+        if (androidName != null && !string.IsNullOrWhiteSpace(androidName.Value))
+        {
+            idAttributeLocalName = "name";
+            idAttributeValue = androidName.Value;
+            idAttributeIsAndroid = true;
+        }
+        else if (string.Equals(name, "manifest", StringComparison.OrdinalIgnoreCase))
+        {
+            var packageAttr = element.Attribute("package");
+            if (packageAttr != null && !string.IsNullOrWhiteSpace(packageAttr.Value))
+            {
+                idAttributeLocalName = "package";
+                idAttributeValue = packageAttr.Value;
+                idAttributeIsAndroid = false;
+            }
+        }
+        else
+        {
+            var nameAttr = element.Attribute("name");
+            if (nameAttr != null && !string.IsNullOrWhiteSpace(nameAttr.Value))
+            {
+                idAttributeLocalName = "name";
+                idAttributeValue = nameAttr.Value;
+                idAttributeIsAndroid = false;
+            }
+        }
+
+        var index = 1;
+        var parent = element.Parent;
+        if (parent != null)
+        {
+            index = parent.Elements(element.Name).TakeWhile(el => el != element).Count() + 1;
+        }
+
+        return new AndroidElementSegment(name, idAttributeLocalName, idAttributeValue, idAttributeIsAndroid, index);
     }
 
     private static List<PropertyEntry> BuildAndroidSdkEntries(string manifestPath, XNamespace androidNs, XElement? sdkElement)
@@ -7702,6 +8005,35 @@ internal static class Program
         public string? PersistedName { get; set; }
         public List<string> EnumValues { get; }
         public Dictionary<string, string> EnumValueMap { get; }
+    }
+
+    private sealed class AndroidElementSegment
+    {
+        public AndroidElementSegment(string name, string? idAttributeLocalName, string? idAttributeValue, bool idAttributeIsAndroid, int index)
+        {
+            Name = name;
+            IdAttributeLocalName = idAttributeLocalName;
+            IdAttributeValue = idAttributeValue;
+            IdAttributeIsAndroid = idAttributeIsAndroid;
+            Index = index;
+        }
+
+        public string Name { get; }
+        public string? IdAttributeLocalName { get; }
+        public string? IdAttributeValue { get; }
+        public bool IdAttributeIsAndroid { get; }
+        public int Index { get; }
+
+        public string ToDisplayString()
+        {
+            if (!string.IsNullOrWhiteSpace(IdAttributeLocalName) && !string.IsNullOrWhiteSpace(IdAttributeValue))
+            {
+                var prefix = IdAttributeIsAndroid ? "android:" : string.Empty;
+                return $"{Name}[{prefix}{IdAttributeLocalName}={IdAttributeValue}]";
+            }
+
+            return $"{Name}[{Index}]";
+        }
     }
 
     private sealed class PlatformPropertyDefinition
