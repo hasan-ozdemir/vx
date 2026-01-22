@@ -1208,24 +1208,31 @@ internal static class Program
         }
 
         dynamic? dynamicProject = project;
+        Dictionary<string, MsBuildPropertyValue>? msbuildMap = null;
+        if (includeMsBuild)
+        {
+            msbuildMap = TryGetMsBuildPropertyMap(dynamicProject);
+            if (msbuildMap != null)
+            {
+                AddPropertyPagesFromMsBuild(pages, dynamicProject, msbuildMap);
+            }
+        }
+
         var projectObject = TryGetValue(() => (object?)dynamicProject?.Object) ?? project;
-        AddPropertyPagesFromObject(pages, projectObject);
+        AddPropertyPagesFromObject(pages, projectObject, msbuildMap);
 
         var configManager = TryGetValue(() => (dynamic)dynamicProject?.ConfigurationManager);
         var activeConfig = TryGetValue(() => (dynamic)configManager?.ActiveConfiguration);
         var configObject = TryGetValue(() => (object?)activeConfig?.Object) ?? (object?)activeConfig;
-        AddPropertyPagesFromObject(pages, configObject);
+        AddPropertyPagesFromObject(pages, configObject, msbuildMap);
 
         var projectProps = TryGetValue(() => (dynamic)dynamicProject?.Properties);
-        AddPropertyPageFromComProperties(pages, projectProps);
+        AddPropertyPageFromComProperties(pages, projectProps, msbuildMap);
 
         var configProps = TryGetValue(() => (dynamic)activeConfig?.Properties);
-        AddPropertyPageFromComProperties(pages, configProps);
+        AddPropertyPageFromComProperties(pages, configProps, msbuildMap);
 
-        if (includeMsBuild)
-        {
-            AddPropertyPagesFromMsBuild(pages, dynamicProject);
-        }
+        pages = DeduplicatePropertyPages(pages);
 
         foreach (var page in pages)
         {
@@ -1242,7 +1249,7 @@ internal static class Program
             .ToList();
     }
 
-    private static void AddPropertyPagesFromObject(List<PropertyPage> pages, object? target)
+    private static void AddPropertyPagesFromObject(List<PropertyPage> pages, object? target, Dictionary<string, MsBuildPropertyValue>? msbuildMap)
     {
         if (target == null)
         {
@@ -1277,7 +1284,17 @@ internal static class Program
                 var displayName = string.IsNullOrWhiteSpace(descriptor.DisplayName) ? descriptorName : descriptor.DisplayName;
                 var category = string.IsNullOrWhiteSpace(descriptor.Category) ? string.Empty : descriptor.Category;
                 var pageName = MapPropertyPageName(category, displayName);
-                AddPropertyEntry(pages, pageName, new PropertyEntry(displayName, descriptorName, target, descriptor, category));
+                var key = NormalizePropertyKey(descriptorName);
+                object? fallbackValue = null;
+                if (msbuildMap != null && msbuildMap.TryGetValue(key, out var msbuildValue))
+                {
+                    fallbackValue = msbuildValue.Value;
+                }
+                var entry = new PropertyEntry(displayName, descriptorName, target, descriptor, category)
+                {
+                    FallbackValue = fallbackValue
+                };
+                AddPropertyEntry(pages, pageName, entry);
             }
             catch
             {
@@ -1286,7 +1303,7 @@ internal static class Program
         }
     }
 
-    private static void AddPropertyPageFromComProperties(List<PropertyPage> pages, dynamic properties)
+    private static void AddPropertyPageFromComProperties(List<PropertyPage> pages, dynamic properties, Dictionary<string, MsBuildPropertyValue>? msbuildMap)
     {
         if (properties == null)
         {
@@ -1307,11 +1324,21 @@ internal static class Program
             }
 
             var pageName = MapPropertyPageName(string.Empty, propName);
-            AddPropertyEntry(pages, pageName, new PropertyEntry(propName, propName, prop, pageName));
+            var key = NormalizePropertyKey(propName);
+            object? fallbackValue = null;
+            if (msbuildMap != null && msbuildMap.TryGetValue(key, out var msbuildValue))
+            {
+                fallbackValue = msbuildValue.Value;
+            }
+            var entry = new PropertyEntry(propName, propName, prop, pageName)
+            {
+                FallbackValue = fallbackValue
+            };
+            AddPropertyEntry(pages, pageName, entry);
         }
     }
 
-    private static void AddPropertyPagesFromMsBuild(List<PropertyPage> pages, dynamic project)
+    private static void AddPropertyPagesFromMsBuild(List<PropertyPage> pages, dynamic project, Dictionary<string, MsBuildPropertyValue> msbuildMap)
     {
         var projectPath = TryGetValue(() => (string?)project.FullName)
             ?? TryGetValue(() => (string?)project.FileName);
@@ -1323,39 +1350,71 @@ internal static class Program
 
         var globalProperties = GetMsBuildGlobalProperties(project);
 
+        foreach (var entryPair in msbuildMap.Values)
+        {
+            var name = entryPair.Name;
+            var value = entryPair.Value;
+            if (!ShouldIncludeMsBuildProperty(name))
+            {
+                continue;
+            }
+
+            var pageName = MapPropertyPageName(string.Empty, name);
+            var category = pageName;
+            object? cachedValue = value;
+            var inferredType = InferMsBuildPropertyType(value?.ToString());
+
+            Action<object?> setter = newValue =>
+            {
+                SetMsBuildProperty(projectPath, globalProperties, name, newValue);
+                cachedValue = newValue;
+            };
+
+            Func<object?> getter = () => cachedValue;
+            var entry = new PropertyEntry(name, name, category, getter, setter, inferredType, PropertySource.MsBuild);
+            AddPropertyEntry(pages, pageName, entry);
+        }
+    }
+
+    private static Dictionary<string, MsBuildPropertyValue>? TryGetMsBuildPropertyMap(dynamic project)
+    {
+        var projectPath = TryGetValue(() => (string?)project.FullName)
+            ?? TryGetValue(() => (string?)project.FileName);
+
+        if (string.IsNullOrWhiteSpace(projectPath) || !File.Exists(projectPath))
+        {
+            return null;
+        }
+
+        var globalProperties = GetMsBuildGlobalProperties(project);
+
         ProjectCollection? collection = null;
         try
         {
             collection = new ProjectCollection(globalProperties);
             var msbuildProject = collection.LoadProject(projectPath);
+            var map = new Dictionary<string, MsBuildPropertyValue>(StringComparer.OrdinalIgnoreCase);
 
             foreach (var prop in msbuildProject.AllEvaluatedProperties)
             {
                 var name = prop.Name;
-                if (!ShouldIncludeMsBuildProperty(name))
+                if (string.IsNullOrWhiteSpace(name))
                 {
                     continue;
                 }
 
-                var pageName = MapPropertyPageName(string.Empty, name);
-                var category = pageName;
-                object? cachedValue = prop.EvaluatedValue;
-                var inferredType = InferMsBuildPropertyType(prop.EvaluatedValue);
-
-                Action<object?> setter = newValue =>
+                var key = NormalizePropertyKey(name);
+                if (!map.ContainsKey(key))
                 {
-                    SetMsBuildProperty(projectPath, globalProperties, name, newValue);
-                    cachedValue = newValue;
-                };
-
-                Func<object?> getter = () => cachedValue;
-                var entry = new PropertyEntry(name, name, category, getter, setter, inferredType, PropertySource.MsBuild);
-                AddPropertyEntry(pages, pageName, entry);
+                    map[key] = new MsBuildPropertyValue(prop.Name, prop.EvaluatedValue);
+                }
             }
+
+            return map;
         }
         catch
         {
-            // Skip MSBuild evaluation issues.
+            return null;
         }
         finally
         {
@@ -1831,6 +1890,44 @@ internal static class Program
         return new string(chars);
     }
 
+    private static List<PropertyPage> DeduplicatePropertyPages(List<PropertyPage> pages)
+    {
+        var bestEntries = new Dictionary<string, PropertyEntry>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var page in pages)
+        {
+            foreach (var entry in page.Items)
+            {
+                var key = NormalizePropertyKey(entry.Key);
+                if (bestEntries.TryGetValue(key, out var existing))
+                {
+                    if (entry.Source < existing.Source)
+                    {
+                        bestEntries[key] = entry;
+                    }
+
+                    continue;
+                }
+
+                bestEntries[key] = entry;
+            }
+        }
+
+        var rebuilt = new List<PropertyPage>();
+        foreach (var known in KnownPropertyPages)
+        {
+            rebuilt.Add(new PropertyPage(known, new List<PropertyEntry>()));
+        }
+
+        foreach (var entry in bestEntries.Values)
+        {
+            var pageName = MapPropertyPageName(entry.Category, entry.Name);
+            AddPropertyEntry(rebuilt, pageName, entry);
+        }
+
+        return rebuilt;
+    }
+
     private static string NormalizePageName(string pageName)
     {
         if (string.IsNullOrWhiteSpace(pageName))
@@ -2075,14 +2172,41 @@ internal static class Program
             var value = GetPropertyValue(entry);
             return FormatPropertyValue(value);
         }
+        catch (NotImplementedException)
+        {
+            if (entry.FallbackValue != null)
+            {
+                return FormatPropertyValue(entry.FallbackValue);
+            }
+
+            return "<unavailable: The method or operation is not implemented.>";
+        }
         catch (COMException ex)
         {
+            if (IsNotImplementedComError(ex) && entry.FallbackValue != null)
+            {
+                return FormatPropertyValue(entry.FallbackValue);
+            }
+
             return $"<unavailable: {ex.Message}>";
         }
         catch (Exception ex)
         {
+            if (entry.FallbackValue != null &&
+                ex.Message.Contains("not implemented", StringComparison.OrdinalIgnoreCase))
+            {
+                return FormatPropertyValue(entry.FallbackValue);
+            }
+
             return $"<unavailable: {ex.Message}>";
         }
+    }
+
+    private static bool IsNotImplementedComError(COMException ex)
+    {
+        const int ENotImpl = unchecked((int)0x80004001);
+        return ex.HResult == ENotImpl
+            || ex.Message.Contains("not implemented", StringComparison.OrdinalIgnoreCase);
     }
 
     private static object? GetPropertyValue(PropertyEntry entry)
@@ -3304,6 +3428,18 @@ internal static class Program
         ComProperty = 2
     }
 
+    private readonly struct MsBuildPropertyValue
+    {
+        public MsBuildPropertyValue(string name, object? value)
+        {
+            Name = name;
+            Value = value;
+        }
+
+        public string Name { get; }
+        public object? Value { get; }
+    }
+
     private sealed class PropertyPage
     {
         public PropertyPage(string name, List<PropertyEntry> items)
@@ -3359,6 +3495,7 @@ internal static class Program
         public Action<object?>? Setter { get; }
         public Type? PropertyType { get; }
         public PropertySource Source { get; }
+        public object? FallbackValue { get; set; }
     }
 
     private sealed class ProjectEntry
