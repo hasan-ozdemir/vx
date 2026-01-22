@@ -1273,10 +1273,11 @@ internal static class Program
                     continue;
                 }
 
-                var displayName = string.IsNullOrWhiteSpace(descriptor.DisplayName) ? descriptor.Name : descriptor.DisplayName;
+                var descriptorName = string.IsNullOrWhiteSpace(descriptor.Name) ? descriptor.DisplayName : descriptor.Name;
+                var displayName = string.IsNullOrWhiteSpace(descriptor.DisplayName) ? descriptorName : descriptor.DisplayName;
                 var category = string.IsNullOrWhiteSpace(descriptor.Category) ? string.Empty : descriptor.Category;
                 var pageName = MapPropertyPageName(category, displayName);
-                AddPropertyEntry(pages, pageName, new PropertyEntry(displayName, target, descriptor, category));
+                AddPropertyEntry(pages, pageName, new PropertyEntry(displayName, descriptorName, target, descriptor, category));
             }
             catch
             {
@@ -1306,7 +1307,7 @@ internal static class Program
             }
 
             var pageName = MapPropertyPageName(string.Empty, propName);
-            AddPropertyEntry(pages, pageName, new PropertyEntry(propName, prop, pageName));
+            AddPropertyEntry(pages, pageName, new PropertyEntry(propName, propName, prop, pageName));
         }
     }
 
@@ -1348,7 +1349,7 @@ internal static class Program
                 };
 
                 Func<object?> getter = () => cachedValue;
-                var entry = new PropertyEntry(name, category, getter, setter, inferredType, PropertySource.MsBuild);
+                var entry = new PropertyEntry(name, name, category, getter, setter, inferredType, PropertySource.MsBuild);
                 AddPropertyEntry(pages, pageName, entry);
             }
         }
@@ -1804,7 +1805,8 @@ internal static class Program
             pages.Add(page);
         }
 
-        var existingIndex = page.Items.FindIndex(item => string.Equals(item.Name, entry.Name, StringComparison.OrdinalIgnoreCase));
+        var entryKey = NormalizePropertyKey(entry.Key);
+        var existingIndex = page.Items.FindIndex(item => string.Equals(NormalizePropertyKey(item.Key), entryKey, StringComparison.OrdinalIgnoreCase));
         if (existingIndex >= 0)
         {
             if (entry.Source < page.Items[existingIndex].Source)
@@ -1816,6 +1818,17 @@ internal static class Program
         }
 
         page.Items.Add(entry);
+    }
+
+    private static string NormalizePropertyKey(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return string.Empty;
+        }
+
+        var chars = value.Where(char.IsLetterOrDigit).ToArray();
+        return new string(chars);
     }
 
     private static string NormalizePageName(string pageName)
@@ -3305,17 +3318,19 @@ internal static class Program
 
     private sealed class PropertyEntry
     {
-        public PropertyEntry(string name, dynamic comProperty, string category)
+        public PropertyEntry(string name, string key, dynamic comProperty, string category)
         {
             Name = name;
+            Key = string.IsNullOrWhiteSpace(key) ? name : key;
             ComProperty = comProperty;
             Category = category;
             Source = PropertySource.ComProperty;
         }
 
-        public PropertyEntry(string name, object owner, PropertyDescriptor descriptor, string category)
+        public PropertyEntry(string name, string key, object owner, PropertyDescriptor descriptor, string category)
         {
             Name = name;
+            Key = string.IsNullOrWhiteSpace(key) ? name : key;
             Owner = owner;
             Descriptor = descriptor;
             Category = category;
@@ -3323,9 +3338,10 @@ internal static class Program
             Source = PropertySource.DteDescriptor;
         }
 
-        public PropertyEntry(string name, string category, Func<object?> getter, Action<object?>? setter, Type? propertyType, PropertySource source)
+        public PropertyEntry(string name, string key, string category, Func<object?> getter, Action<object?>? setter, Type? propertyType, PropertySource source)
         {
             Name = name;
+            Key = string.IsNullOrWhiteSpace(key) ? name : key;
             Category = category;
             Getter = getter;
             Setter = setter;
@@ -3334,6 +3350,7 @@ internal static class Program
         }
 
         public string Name { get; }
+        public string Key { get; }
         public string Category { get; }
         public object? Owner { get; }
         public PropertyDescriptor? Descriptor { get; }
