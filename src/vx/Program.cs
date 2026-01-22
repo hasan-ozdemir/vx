@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -124,7 +125,14 @@ internal static class Program
             }
             else
             {
-                Console.WriteLine("VS2022 running: no");
+                if (IsVisualStudioProcessRunning())
+                {
+                    Console.WriteLine("VS2022 running: yes (process detected, DTE unavailable)");
+                }
+                else
+                {
+                    Console.WriteLine("VS2022 running: no");
+                }
             }
 
             return 0;
@@ -230,6 +238,12 @@ internal static class Program
                 return 0;
             }
 
+            if (IsVisualStudioProcessRunning())
+            {
+                Console.Error.WriteLine("Visual Studio process detected but DTE is not accessible. Run vx as Administrator or restart Visual Studio without elevation.");
+                return 1;
+            }
+
             OpenInNewInstance(fullPath);
             return 0;
         }
@@ -289,9 +303,8 @@ internal static class Program
         try
         {
             OleMessageFilter.Register();
-            if (instances.Count == 0)
+            if (!EnsureVsInstanceAvailable(instances))
             {
-                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
                 return 1;
             }
 
@@ -408,9 +421,8 @@ internal static class Program
         try
         {
             OleMessageFilter.Register();
-            if (instances.Count == 0)
+            if (!EnsureVsInstanceAvailable(instances))
             {
-                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
                 return 1;
             }
 
@@ -669,9 +681,8 @@ internal static class Program
         try
         {
             OleMessageFilter.Register();
-            if (instances.Count == 0)
+            if (!EnsureVsInstanceAvailable(instances))
             {
-                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
                 return 1;
             }
 
@@ -740,9 +751,8 @@ internal static class Program
         try
         {
             OleMessageFilter.Register();
-            if (instances.Count == 0)
+            if (!EnsureVsInstanceAvailable(instances))
             {
-                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
                 return 1;
             }
 
@@ -1370,7 +1380,18 @@ internal static class Program
         {
             if (!MSBuildLocator.IsRegistered)
             {
-                MSBuildLocator.RegisterDefaults();
+                var instances = MSBuildLocator.QueryVisualStudioInstances().ToList();
+                if (instances.Count > 0)
+                {
+                    var instance = instances
+                        .OrderByDescending(item => item.Version)
+                        .First();
+                    MSBuildLocator.RegisterInstance(instance);
+                }
+                else
+                {
+                    MSBuildLocator.RegisterDefaults();
+                }
             }
 
             MsBuildRegistrationSucceeded = true;
@@ -1378,8 +1399,17 @@ internal static class Program
         }
         catch (Exception ex)
         {
+            var fallbackError = ex.Message;
+            if (TryRegisterMsBuildViaVswhere(out var vswhereError))
+            {
+                MsBuildRegistrationSucceeded = true;
+                return true;
+            }
+
             MsBuildRegistrationSucceeded = false;
-            error = ex.Message;
+            error = string.IsNullOrWhiteSpace(vswhereError)
+                ? fallbackError
+                : $"{fallbackError} {vswhereError}";
             return false;
         }
     }
@@ -1399,6 +1429,187 @@ internal static class Program
         }
 
         return success;
+    }
+
+    private static bool TryRegisterMsBuildViaVswhere(out string? error)
+    {
+        error = null;
+        if (MSBuildLocator.IsRegistered)
+        {
+            return true;
+        }
+
+        if (!TryFindMsBuildPath(out var msbuildPath, out error))
+        {
+            return false;
+        }
+
+        try
+        {
+            MSBuildLocator.RegisterMSBuildPath(msbuildPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private static bool TryFindMsBuildPath(out string? msbuildPath, out string? error)
+    {
+        msbuildPath = null;
+        error = null;
+
+        var vswherePath = GetVswherePath();
+        if (!string.IsNullOrWhiteSpace(vswherePath))
+        {
+            var arguments = "-latest -products * -requires Microsoft.Component.MSBuild -find \"MSBuild\\**\\Bin\\MSBuild.exe\" -prerelease";
+            if (TryRunProcess(vswherePath, arguments, out var stdout, out var stderr))
+            {
+                var first = stdout
+                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(line => line.Trim())
+                    .FirstOrDefault(line => !string.IsNullOrWhiteSpace(line));
+
+                if (!string.IsNullOrWhiteSpace(first) && File.Exists(first))
+                {
+                    msbuildPath = Path.GetDirectoryName(first);
+                    if (!string.IsNullOrWhiteSpace(msbuildPath))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(stderr))
+            {
+                error = stderr.Trim();
+            }
+        }
+
+        foreach (var root in GetCandidateVisualStudioRoots())
+        {
+            var candidate = Path.Combine(root, "MSBuild", "Current", "Bin");
+            if (File.Exists(Path.Combine(candidate, "MSBuild.exe")))
+            {
+                msbuildPath = candidate;
+                return true;
+            }
+        }
+
+        error = error ?? "No MSBuild install found.";
+        return false;
+    }
+
+    private static string? GetVswherePath()
+    {
+        var programFilesX86 = Environment.GetEnvironmentVariable("ProgramFiles(x86)")
+            ?? Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+
+        if (string.IsNullOrWhiteSpace(programFilesX86))
+        {
+            return null;
+        }
+
+        var candidate = Path.Combine(programFilesX86, "Microsoft Visual Studio", "Installer", "vswhere.exe");
+        return File.Exists(candidate) ? candidate : null;
+    }
+
+    private static IEnumerable<string> GetCandidateVisualStudioRoots()
+    {
+        var roots = new List<string>();
+        var programFiles = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+        var programFilesX86 = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+
+        if (!string.IsNullOrWhiteSpace(programFiles))
+        {
+            roots.Add(programFiles);
+        }
+
+        if (!string.IsNullOrWhiteSpace(programFilesX86) && !string.Equals(programFiles, programFilesX86, StringComparison.OrdinalIgnoreCase))
+        {
+            roots.Add(programFilesX86);
+        }
+
+        foreach (var root in roots.Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            var vsRoot = Path.Combine(root, "Microsoft Visual Studio", "2022");
+            if (!Directory.Exists(vsRoot))
+            {
+                continue;
+            }
+
+            foreach (var edition in Directory.EnumerateDirectories(vsRoot))
+            {
+                yield return edition;
+            }
+        }
+    }
+
+    private static bool TryRunProcess(string fileName, string arguments, out string stdout, out string stderr)
+    {
+        stdout = string.Empty;
+        stderr = string.Empty;
+
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                Arguments = arguments,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+
+            using var process = Process.Start(startInfo);
+            if (process == null)
+            {
+                return false;
+            }
+
+            stdout = process.StandardOutput.ReadToEnd();
+            stderr = process.StandardError.ReadToEnd();
+            process.WaitForExit(3000);
+            return process.ExitCode == 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool IsVisualStudioProcessRunning()
+    {
+        try
+        {
+            return Process.GetProcessesByName("devenv").Length > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool EnsureVsInstanceAvailable(List<VsInstance> instances)
+    {
+        if (instances.Count > 0)
+        {
+            return true;
+        }
+
+        if (IsVisualStudioProcessRunning())
+        {
+            Console.Error.WriteLine("Visual Studio process detected but DTE is not accessible. Run vx as Administrator or restart Visual Studio without elevation.");
+        }
+        else
+        {
+            Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
+        }
+
+        return false;
     }
 
     private static Dictionary<string, string> GetMsBuildGlobalProperties(dynamic project)
@@ -1993,9 +2204,8 @@ internal static class Program
         try
         {
             OleMessageFilter.Register();
-            if (instances.Count == 0)
+            if (!EnsureVsInstanceAvailable(instances))
             {
-                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
                 return 1;
             }
 
@@ -2101,9 +2311,8 @@ internal static class Program
         try
         {
             OleMessageFilter.Register();
-            if (instances.Count == 0)
+            if (!EnsureVsInstanceAvailable(instances))
             {
-                Console.Error.WriteLine("No running Visual Studio 2022 instance found.");
                 return 1;
             }
 
@@ -3077,9 +3286,9 @@ internal static class Program
 
     private enum PropertySource
     {
-        DteDescriptor = 0,
-        ComProperty = 1,
-        MsBuild = 2
+        MsBuild = 0,
+        DteDescriptor = 1,
+        ComProperty = 2
     }
 
     private sealed class PropertyPage
