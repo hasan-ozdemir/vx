@@ -1208,29 +1208,31 @@ internal static class Program
         }
 
         dynamic? dynamicProject = project;
+        MsBuildEvaluation? msbuildEvaluation = null;
         Dictionary<string, MsBuildPropertyValue>? msbuildMap = null;
         if (includeMsBuild)
         {
-            msbuildMap = TryGetMsBuildPropertyMap(dynamicProject);
-            if (msbuildMap != null)
+            msbuildEvaluation = TryCreateMsBuildEvaluation(dynamicProject);
+            if (msbuildEvaluation != null)
             {
+                msbuildMap = BuildMsBuildPropertyMap(msbuildEvaluation.Project);
                 AddPropertyPagesFromMsBuild(pages, dynamicProject, msbuildMap);
             }
         }
 
         var projectObject = TryGetValue(() => (object?)dynamicProject?.Object) ?? project;
-        AddPropertyPagesFromObject(pages, projectObject, msbuildMap);
+        AddPropertyPagesFromObject(pages, projectObject, msbuildMap, msbuildEvaluation);
 
         var configManager = TryGetValue(() => (dynamic)dynamicProject?.ConfigurationManager);
         var activeConfig = TryGetValue(() => (dynamic)configManager?.ActiveConfiguration);
         var configObject = TryGetValue(() => (object?)activeConfig?.Object) ?? (object?)activeConfig;
-        AddPropertyPagesFromObject(pages, configObject, msbuildMap);
+        AddPropertyPagesFromObject(pages, configObject, msbuildMap, msbuildEvaluation);
 
         var projectProps = TryGetValue(() => (dynamic)dynamicProject?.Properties);
-        AddPropertyPageFromComProperties(pages, projectProps, msbuildMap);
+        AddPropertyPageFromComProperties(pages, projectProps, msbuildMap, msbuildEvaluation);
 
         var configProps = TryGetValue(() => (dynamic)activeConfig?.Properties);
-        AddPropertyPageFromComProperties(pages, configProps, msbuildMap);
+        AddPropertyPageFromComProperties(pages, configProps, msbuildMap, msbuildEvaluation);
 
         pages = DeduplicatePropertyPages(pages);
 
@@ -1239,7 +1241,7 @@ internal static class Program
             page.Items.Sort((a, b) => string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase));
         }
 
-        return pages
+        var ordered = pages
             .OrderBy(p =>
             {
                 var index = Array.IndexOf(KnownPropertyPages, p.Name);
@@ -1247,9 +1249,12 @@ internal static class Program
             })
             .ThenBy(p => p.Name, StringComparer.OrdinalIgnoreCase)
             .ToList();
+
+        msbuildEvaluation?.Dispose();
+        return ordered;
     }
 
-    private static void AddPropertyPagesFromObject(List<PropertyPage> pages, object? target, Dictionary<string, MsBuildPropertyValue>? msbuildMap)
+    private static void AddPropertyPagesFromObject(List<PropertyPage> pages, object? target, Dictionary<string, MsBuildPropertyValue>? msbuildMap, MsBuildEvaluation? msbuildEvaluation)
     {
         if (target == null)
         {
@@ -1290,6 +1295,10 @@ internal static class Program
                 {
                     fallbackValue = msbuildValue.Value;
                 }
+                else if (msbuildEvaluation != null && !string.IsNullOrWhiteSpace(descriptorName))
+                {
+                    fallbackValue = msbuildEvaluation.Project.GetPropertyValue(descriptorName);
+                }
                 var entry = new PropertyEntry(displayName, descriptorName, target, descriptor, category)
                 {
                     FallbackValue = fallbackValue
@@ -1303,7 +1312,7 @@ internal static class Program
         }
     }
 
-    private static void AddPropertyPageFromComProperties(List<PropertyPage> pages, dynamic properties, Dictionary<string, MsBuildPropertyValue>? msbuildMap)
+    private static void AddPropertyPageFromComProperties(List<PropertyPage> pages, dynamic properties, Dictionary<string, MsBuildPropertyValue>? msbuildMap, MsBuildEvaluation? msbuildEvaluation)
     {
         if (properties == null)
         {
@@ -1329,6 +1338,10 @@ internal static class Program
             if (msbuildMap != null && msbuildMap.TryGetValue(key, out var msbuildValue))
             {
                 fallbackValue = msbuildValue.Value;
+            }
+            else if (msbuildEvaluation != null && !string.IsNullOrWhiteSpace(propName))
+            {
+                fallbackValue = msbuildEvaluation.Project.GetPropertyValue(propName);
             }
             var entry = new PropertyEntry(propName, propName, prop, pageName)
             {
@@ -1376,7 +1389,7 @@ internal static class Program
         }
     }
 
-    private static Dictionary<string, MsBuildPropertyValue>? TryGetMsBuildPropertyMap(dynamic project)
+    private static MsBuildEvaluation? TryCreateMsBuildEvaluation(dynamic project)
     {
         var projectPath = TryGetValue(() => (string?)project.FullName)
             ?? TryGetValue(() => (string?)project.FileName);
@@ -1388,42 +1401,41 @@ internal static class Program
 
         var globalProperties = GetMsBuildGlobalProperties(project);
 
-        ProjectCollection? collection = null;
         try
         {
-            collection = new ProjectCollection(globalProperties);
-            var msbuildProject = collection.LoadProject(projectPath);
-            var map = new Dictionary<string, MsBuildPropertyValue>(StringComparer.OrdinalIgnoreCase);
-
-            foreach (var prop in msbuildProject.AllEvaluatedProperties)
-            {
-                var name = prop.Name;
-                if (string.IsNullOrWhiteSpace(name))
-                {
-                    continue;
-                }
-
-                var key = NormalizePropertyKey(name);
-                if (!map.ContainsKey(key))
-                {
-                    map[key] = new MsBuildPropertyValue(prop.Name, prop.EvaluatedValue);
-                }
-            }
-
-            return map;
+            var collection = new ProjectCollection(globalProperties);
+            var loadSettings = ProjectLoadSettings.IgnoreMissingImports
+                | ProjectLoadSettings.IgnoreInvalidImports
+                | ProjectLoadSettings.IgnoreEmptyImports;
+            var msbuildProject = new Project(projectPath, globalProperties, null, collection, loadSettings);
+            return new MsBuildEvaluation(collection, msbuildProject);
         }
         catch
         {
             return null;
         }
-        finally
+    }
+
+    private static Dictionary<string, MsBuildPropertyValue> BuildMsBuildPropertyMap(Project msbuildProject)
+    {
+        var map = new Dictionary<string, MsBuildPropertyValue>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var prop in msbuildProject.AllEvaluatedProperties)
         {
-            if (collection != null)
+            var name = prop.Name;
+            if (string.IsNullOrWhiteSpace(name))
             {
-                collection.UnloadAllProjects();
-                collection.Dispose();
+                continue;
+            }
+
+            var key = NormalizePropertyKey(name);
+            if (!map.ContainsKey(key))
+            {
+                map[key] = new MsBuildPropertyValue(prop.Name, prop.EvaluatedValue);
             }
         }
+
+        return map;
     }
 
     private static bool EnsureMsBuildRegistered(out string? error)
@@ -3443,6 +3455,24 @@ internal static class Program
 
         public string Name { get; }
         public object? Value { get; }
+    }
+
+    private sealed class MsBuildEvaluation : IDisposable
+    {
+        public MsBuildEvaluation(ProjectCollection collection, Project project)
+        {
+            Collection = collection;
+            Project = project;
+        }
+
+        public ProjectCollection Collection { get; }
+        public Project Project { get; }
+
+        public void Dispose()
+        {
+            Collection.UnloadAllProjects();
+            Collection.Dispose();
+        }
     }
 
     private sealed class PropertyPage
