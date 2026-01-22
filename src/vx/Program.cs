@@ -1154,25 +1154,46 @@ internal static class Program
             return;
         }
 
-        var descriptors = TypeDescriptor.GetProperties(target);
+        PropertyDescriptorCollection? descriptors;
+        try
+        {
+            descriptors = TypeDescriptor.GetProperties(target);
+        }
+        catch
+        {
+            return;
+        }
+
+        if (descriptors == null || descriptors.Count == 0)
+        {
+            return;
+        }
+
         foreach (PropertyDescriptor descriptor in descriptors)
         {
-            if (!descriptor.IsBrowsable)
+            try
             {
-                continue;
-            }
+                if (!descriptor.IsBrowsable)
+                {
+                    continue;
+                }
 
-            var category = string.IsNullOrWhiteSpace(descriptor.Category) ? "General" : descriptor.Category;
-            var pageName = $"{sectionName} / {category}";
-            var page = pages.FirstOrDefault(p => string.Equals(p.Name, pageName, StringComparison.OrdinalIgnoreCase));
-            if (page == null)
+                var category = string.IsNullOrWhiteSpace(descriptor.Category) ? "General" : descriptor.Category;
+                var pageName = $"{sectionName} / {category}";
+                var page = pages.FirstOrDefault(p => string.Equals(p.Name, pageName, StringComparison.OrdinalIgnoreCase));
+                if (page == null)
+                {
+                    page = new PropertyPage(pageName, new List<PropertyEntry>());
+                    pages.Add(page);
+                }
+
+                var displayName = string.IsNullOrWhiteSpace(descriptor.DisplayName) ? descriptor.Name : descriptor.DisplayName;
+                page.Items.Add(new PropertyEntry(displayName, target, descriptor));
+            }
+            catch
             {
-                page = new PropertyPage(pageName, new List<PropertyEntry>());
-                pages.Add(page);
+                // Skip properties that throw during descriptor access.
             }
-
-            var displayName = string.IsNullOrWhiteSpace(descriptor.DisplayName) ? descriptor.Name : descriptor.DisplayName;
-            page.Items.Add(new PropertyEntry(displayName, target, descriptor));
         }
 
         foreach (var page in pages)
