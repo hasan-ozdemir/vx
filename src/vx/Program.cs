@@ -719,10 +719,13 @@ internal static class Program
                 return 1;
             }
 
-            using var uiaSession = UiaPropertySession.TryCreate(dte, project);
-            if (uiaSession != null)
+            if (IsUiaEnabledForList())
             {
-                OverlayUiaValues(pages, uiaSession);
+                using var uiaSession = UiaPropertySession.TryCreate(dte, project);
+                if (uiaSession != null)
+                {
+                    OverlayUiaValues(pages, uiaSession);
+                }
             }
 
             foreach (var page in pages.Where(p => p.Items.Count > 0))
@@ -793,8 +796,20 @@ internal static class Program
             }
 
             var includeMsBuild = PrepareMsBuild();
-            using var uiaSession = UiaPropertySession.TryCreate(dte, project);
-            return RunPropertyWizardForProject(project, includeMsBuild, uiaSession);
+            UiaPropertySession? uiaSession = null;
+            if (!IsUiaDisabled())
+            {
+                uiaSession = UiaPropertySession.TryCreate(dte, project);
+            }
+
+            try
+            {
+                return RunPropertyWizardForProject(project, includeMsBuild, uiaSession);
+            }
+            finally
+            {
+                uiaSession?.Dispose();
+            }
         }
         catch (COMException ex)
         {
@@ -1573,10 +1588,76 @@ internal static class Program
         return success;
     }
 
+    private static bool IsUiaDisabled()
+    {
+        var value = Environment.GetEnvironmentVariable("VX_DISABLE_UIA");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsUiaEnabledForList()
+    {
+        if (IsUiaDisabled())
+        {
+            return false;
+        }
+
+        var value = Environment.GetEnvironmentVariable("VX_UIA_LIST");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsUiaDebugEnabled()
+    {
+        var value = Environment.GetEnvironmentVariable("VX_UIA_DEBUG");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int GetUiaTimeoutMs(string envName, int defaultValue)
+    {
+        var value = Environment.GetEnvironmentVariable(envName);
+        if (int.TryParse(value, out var parsed) && parsed > 0)
+        {
+            return parsed;
+        }
+
+        return defaultValue;
+    }
+
+    private static void UiaDebug(string message)
+    {
+        if (!IsUiaDebugEnabled())
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"[uia] {message}");
+    }
+
     private static void LogUiaUnavailable(string message)
     {
         if (UiaUnavailableLogged)
         {
+            UiaDebug($"UI Automation unavailable: {message}");
             return;
         }
 
@@ -2976,21 +3057,9 @@ internal static class Program
     {
         try
         {
-            var explorer = TryGetValue(() => (dynamic)dte.ToolWindows.SolutionExplorer);
-            if (explorer == null)
+            if (TryInvoke(() => dte.ActiveSolutionProjects = new object[] { project }, out _))
             {
-                return false;
-            }
-
-            var rootItems = TryGetValue(() => (dynamic)explorer.UIHierarchyItems);
-            foreach (var item in EnumerateComCollection(rootItems))
-            {
-                var match = FindProjectHierarchyItem(item, project);
-                if (match != null)
-                {
-                    TryInvoke(() => match.Select(VsUiSelectionTypeSelect), out _);
-                    return true;
-                }
+                return true;
             }
         }
         catch
@@ -3810,17 +3879,25 @@ internal static class Program
         {
             try
             {
+                UiaDebug("Starting UI Automation session.");
                 TryInvoke(() => dte.MainWindow.Activate(), out _);
-                if (!TrySelectProjectInSolutionExplorer(dte, project))
+                var projectSelected = TrySelectProjectInSolutionExplorer(dte, project);
+                if (!projectSelected)
                 {
                     LogUiaUnavailable("Project could not be selected in Solution Explorer.");
-                    return null;
+                }
+                else
+                {
+                    UiaDebug("Active project set.");
                 }
 
                 if (!TryOpenProjectProperties(dte))
                 {
                     LogUiaUnavailable("Project properties command is unavailable.");
-                    return null;
+                }
+                else
+                {
+                    UiaDebug("Project properties command invoked.");
                 }
 
                 var hwnd = TryGetValue(() => (int)dte.MainWindow.HWnd, 0);
@@ -3837,15 +3914,40 @@ internal static class Program
                     return null;
                 }
 
+                var processId = vsRoot.Current.ProcessId;
                 var projectName = TryGetValue(() => (string?)project.Name) ?? string.Empty;
-                var propertyRoot = WaitForPropertyPagesRoot(vsRoot, projectName);
+                AutomationElement? propertyRoot = null;
+                var allowUnknownTree = false;
+                var propertyWindowHandle = WaitForPropertyWindowHandle(dte, projectName);
+                if (propertyWindowHandle != 0)
+                {
+                    UiaDebug("Checking DTE window handle for property pages.");
+                    var windowRoot = AutomationElement.FromHandle(new IntPtr(propertyWindowHandle));
+                    if (windowRoot != null && FindPropertyPagesTree(windowRoot, allowUnknownTree: true) != null)
+                    {
+                        propertyRoot = windowRoot;
+                        allowUnknownTree = true;
+                    }
+                }
+
+                if (propertyRoot == null)
+                {
+                    UiaDebug("Searching for property pages UI.");
+                }
+                propertyRoot ??= WaitForPropertyPagesRoot(vsRoot, projectName, processId);
                 if (propertyRoot == null)
                 {
                     LogUiaUnavailable("Project property pages UI not found.");
                     return null;
                 }
 
-                var pageTree = FindPropertyPagesTree(propertyRoot);
+                UiaDebug("Property pages UI found.");
+                var pageTree = FindPropertyPagesTree(propertyRoot, allowUnknownTree);
+                if (pageTree == null)
+                {
+                    UiaDebug("Property pages tree not found with known names; retrying without name checks.");
+                    pageTree = FindPropertyPagesTree(propertyRoot, allowUnknownTree: true);
+                }
                 if (pageTree == null)
                 {
                     LogUiaUnavailable("Property pages navigation tree not found.");
@@ -3859,6 +3961,7 @@ internal static class Program
                     return null;
                 }
 
+                UiaDebug($"Property pages enumerated: {pages.Count}.");
                 return new UiaPropertySession(vsRoot, propertyRoot, pageTree, pages);
             }
             catch (Exception ex)
@@ -3871,15 +3974,35 @@ internal static class Program
         public Dictionary<string, Dictionary<string, string>> ReadAllPages()
         {
             var result = new Dictionary<string, Dictionary<string, string>>(StringComparer.OrdinalIgnoreCase);
+            var totalTimeoutMs = GetUiaTimeoutMs("VX_UIA_TIMEOUT_MS", 8000);
+            var perPageTimeoutMs = GetUiaTimeoutMs("VX_UIA_PAGE_TIMEOUT_MS", 1500);
+            var start = Environment.TickCount64;
             foreach (var page in _pageItems)
             {
+                if (totalTimeoutMs > 0 && Environment.TickCount64 - start > totalTimeoutMs)
+                {
+                    UiaDebug("UI Automation time budget reached; stopping page traversal.");
+                    break;
+                }
+
+                UiaDebug($"Reading page '{page.Key}'.");
                 if (!TrySelectPage(page.Key))
                 {
                     continue;
                 }
 
                 Thread.Sleep(UiDelayMilliseconds);
-                var rows = ReadPropertyRows(_propertyRoot);
+                var remaining = totalTimeoutMs > 0
+                    ? (int)Math.Max(0, totalTimeoutMs - (Environment.TickCount64 - start))
+                    : perPageTimeoutMs;
+                var timeoutMs = Math.Min(perPageTimeoutMs, remaining);
+                if (timeoutMs <= 0)
+                {
+                    UiaDebug("UI Automation time budget exhausted before reading page.");
+                    break;
+                }
+
+                var rows = ReadPropertyRowsWithTimeout(_propertyRoot, timeoutMs);
                 if (rows.Count == 0)
                 {
                     continue;
@@ -3910,7 +4033,8 @@ internal static class Program
             }
 
             Thread.Sleep(UiDelayMilliseconds);
-            var rows = ReadPropertyRows(_propertyRoot);
+            var timeoutMs = GetUiaTimeoutMs("VX_UIA_PAGE_TIMEOUT_MS", 1500);
+            var rows = ReadPropertyRowsWithTimeout(_propertyRoot, timeoutMs);
             var targetKey = NormalizePropertyKey(propertyName);
             var row = rows.FirstOrDefault(r => NormalizePropertyKey(r.Name) == targetKey);
             if (string.IsNullOrWhiteSpace(row.Name))
@@ -3937,7 +4061,8 @@ internal static class Program
         {
             if (_pageItems.TryGetValue(pageName, out var item))
             {
-                return TrySelectTreeItem(item);
+                var timeoutMs = GetUiaTimeoutMs("VX_UIA_SELECT_TIMEOUT_MS", 800);
+                return TrySelectTreeItemWithTimeout(item, timeoutMs);
             }
 
             var match = _pageItems.Keys.FirstOrDefault(key =>
@@ -3946,17 +4071,80 @@ internal static class Program
 
             if (match != null && _pageItems.TryGetValue(match, out var matchedItem))
             {
-                return TrySelectTreeItem(matchedItem);
+                var timeoutMs = GetUiaTimeoutMs("VX_UIA_SELECT_TIMEOUT_MS", 800);
+                return TrySelectTreeItemWithTimeout(matchedItem, timeoutMs);
             }
 
             return false;
         }
 
-        private static AutomationElement? WaitForPropertyPagesRoot(AutomationElement vsRoot, string projectName)
+        private static int WaitForPropertyWindowHandle(dynamic dte, string projectName)
+        {
+            for (var i = 0; i < 10; i++)
+            {
+                var handle = TryGetPropertyWindowHandle(dte, projectName);
+                if (handle != 0)
+                {
+                    return handle;
+                }
+
+                Thread.Sleep(200);
+            }
+
+            return 0;
+        }
+
+        private static int TryGetPropertyWindowHandle(dynamic dte, string projectName)
+        {
+            var activeWindow = TryGetValue(() => (dynamic)dte.ActiveWindow);
+            var activeHandle = TryGetValue(() => (int)activeWindow.HWnd, 0);
+            var activeCaption = TryGetValue(() => (string?)activeWindow.Caption) ?? string.Empty;
+            var fallbackHandle = activeHandle;
+            if (activeHandle != 0 && WindowCaptionMatchesProject(activeCaption, projectName))
+            {
+                return activeHandle;
+            }
+
+            var windows = TryGetValue(() => (dynamic)dte.Windows);
+            foreach (var window in EnumerateComCollection(windows))
+            {
+                var caption = TryGetValue(() => (string?)window.Caption) ?? string.Empty;
+                if (!WindowCaptionMatchesProject(caption, projectName))
+                {
+                    continue;
+                }
+
+                var hwnd = TryGetValue(() => (int)window.HWnd, 0);
+                if (hwnd != 0)
+                {
+                    return hwnd;
+                }
+            }
+
+            return fallbackHandle;
+        }
+
+        private static bool WindowCaptionMatchesProject(string caption, string projectName)
+        {
+            if (string.IsNullOrWhiteSpace(caption))
+            {
+                return false;
+            }
+
+            if (!string.IsNullOrWhiteSpace(projectName) &&
+                caption.Contains(projectName, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            return caption.Contains("Properties", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static AutomationElement? WaitForPropertyPagesRoot(AutomationElement vsRoot, string projectName, int processId)
         {
             for (var i = 0; i < 25; i++)
             {
-                var candidate = FindPropertyPagesRoot(vsRoot, projectName);
+                var candidate = FindPropertyPagesRoot(vsRoot, projectName, processId);
                 if (candidate != null)
                 {
                     return candidate;
@@ -3968,38 +4156,139 @@ internal static class Program
             return null;
         }
 
-        private static AutomationElement? FindPropertyPagesRoot(AutomationElement vsRoot, string projectName)
+        private static AutomationElement? FindPropertyPagesRoot(AutomationElement vsRoot, string projectName, int processId)
         {
-            var conditions = new OrCondition(
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Window),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Pane),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
+            return FindPropertyPagesRootByTraversal(vsRoot);
+        }
 
-            var candidates = vsRoot.FindAll(TreeScope.Descendants, conditions);
-            foreach (AutomationElement candidate in candidates)
+        private static AutomationElement? FindPropertyPagesRootByTraversal(AutomationElement root)
+        {
+            const int maxNodes = 5000;
+            const int maxDepth = 8;
+            var queue = new Queue<(AutomationElement Element, int Depth)>();
+            queue.Enqueue((root, 0));
+            var walker = TreeWalker.ControlViewWalker;
+            var checkedRoots = new HashSet<int>();
+            var visited = 0;
+
+            while (queue.Count > 0)
             {
-                var name = candidate.Current.Name ?? string.Empty;
-                if (!name.Contains("Properties", StringComparison.OrdinalIgnoreCase) &&
-                    (string.IsNullOrWhiteSpace(projectName) || !name.Contains(projectName, StringComparison.OrdinalIgnoreCase)))
+                var (element, depth) = queue.Dequeue();
+                visited++;
+                if (visited > maxNodes)
+                {
+                    break;
+                }
+
+                var controlType = element.Current.ControlType;
+                if (controlType == ControlType.Tree)
+                {
+                    if (ContainsKnownPage(element))
+                    {
+                        return GetPropertyRootFromTree(element);
+                    }
+
+                    var candidateRoot = GetPropertyRootFromTree(element);
+                    if (ReferenceEquals(candidateRoot, element))
+                    {
+                        continue;
+                    }
+
+                    var nativeHandle = 0;
+                    try
+                    {
+                        nativeHandle = candidateRoot.Current.NativeWindowHandle;
+                    }
+                    catch
+                    {
+                        nativeHandle = 0;
+                    }
+
+                    if (nativeHandle != 0 && !checkedRoots.Add(nativeHandle))
+                    {
+                        continue;
+                    }
+
+                    return candidateRoot;
+                }
+
+                if (depth >= maxDepth)
                 {
                     continue;
                 }
 
-                var tree = FindPropertyPagesTree(candidate);
-                if (tree != null)
+                AutomationElement? child = null;
+                try
                 {
-                    return candidate;
+                    child = walker.GetFirstChild(element);
+                }
+                catch
+                {
+                    child = null;
+                }
+
+                while (child != null)
+                {
+                    queue.Enqueue((child, depth + 1));
+                    try
+                    {
+                        child = walker.GetNextSibling(child);
+                    }
+                    catch
+                    {
+                        break;
+                    }
                 }
             }
 
+            UiaDebug("UI Automation traversal did not locate property pages tree.");
             return null;
         }
 
-        private static AutomationElement? FindPropertyPagesTree(AutomationElement root)
+        private static AutomationElement GetPropertyRootFromTree(AutomationElement tree)
+        {
+            var walker = TreeWalker.ControlViewWalker;
+            var current = tree;
+            AutomationElement? best = null;
+            while (true)
+            {
+                AutomationElement? parent;
+                try
+                {
+                    parent = walker.GetParent(current);
+                }
+                catch
+                {
+                    break;
+                }
+
+                if (parent == null)
+                {
+                    break;
+                }
+
+                var type = parent.Current.ControlType;
+                if (type == ControlType.Window || type == ControlType.Pane || type == ControlType.Document)
+                {
+                    if (FindPropertyGrid(parent) != null)
+                    {
+                        best = parent;
+                    }
+                }
+
+                current = parent;
+            }
+
+            return best ?? tree;
+        }
+
+
+
+        private static AutomationElement? FindPropertyPagesTree(AutomationElement root, bool allowUnknownTree = false)
         {
             var tree = root.FindFirst(TreeScope.Descendants,
                 new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Tree));
-            if (tree != null && ContainsKnownPage(tree))
+            if (tree != null && (allowUnknownTree || ContainsKnownPage(tree)))
             {
                 return tree;
             }
@@ -4008,7 +4297,7 @@ internal static class Program
                 new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Tree));
             foreach (AutomationElement candidate in trees)
             {
-                if (ContainsKnownPage(candidate))
+                if (allowUnknownTree || ContainsKnownPage(candidate))
                 {
                     return candidate;
                 }
@@ -4045,17 +4334,27 @@ internal static class Program
             var map = new Dictionary<string, AutomationElement>(StringComparer.OrdinalIgnoreCase);
             var rootItems = tree.FindAll(TreeScope.Children,
                 new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.TreeItem));
+            var remaining = 200;
 
             foreach (AutomationElement item in rootItems)
             {
-                AddTreeItem(map, item, null);
+                AddTreeItem(map, item, null, ref remaining);
+                if (remaining <= 0)
+                {
+                    break;
+                }
             }
 
             return map;
         }
 
-        private static void AddTreeItem(Dictionary<string, AutomationElement> map, AutomationElement item, string? parentPath)
+        private static void AddTreeItem(Dictionary<string, AutomationElement> map, AutomationElement item, string? parentPath, ref int remaining)
         {
+            if (remaining <= 0)
+            {
+                return;
+            }
+
             var name = item.Current.Name;
             if (string.IsNullOrWhiteSpace(name))
             {
@@ -4064,6 +4363,11 @@ internal static class Program
 
             var path = string.IsNullOrWhiteSpace(parentPath) ? name : $"{parentPath}/{name}";
             map[path] = item;
+            remaining--;
+            if (remaining <= 0)
+            {
+                return;
+            }
 
             if (TryExpand(item))
             {
@@ -4075,7 +4379,11 @@ internal static class Program
 
             foreach (AutomationElement child in children)
             {
-                AddTreeItem(map, child, path);
+                AddTreeItem(map, child, path, ref remaining);
+                if (remaining <= 0)
+                {
+                    return;
+                }
             }
         }
 
@@ -4104,6 +4412,55 @@ internal static class Program
             }
         }
 
+        private static bool TrySelectTreeItemWithTimeout(AutomationElement item, int timeoutMs)
+        {
+            if (timeoutMs <= 0)
+            {
+                return false;
+            }
+
+            var result = false;
+            Exception? error = null;
+            var thread = new Thread(() =>
+            {
+                try
+                {
+                    result = TrySelectTreeItem(item);
+                }
+                catch (Exception ex)
+                {
+                    error = ex;
+                }
+            })
+            {
+                IsBackground = true
+            };
+
+            try
+            {
+                thread.SetApartmentState(ApartmentState.STA);
+            }
+            catch
+            {
+                // Ignore STA failures.
+            }
+
+            thread.Start();
+            if (!thread.Join(timeoutMs))
+            {
+                UiaDebug("UI Automation tree selection timed out.");
+                return false;
+            }
+
+            if (error != null)
+            {
+                UiaDebug($"UI Automation tree selection failed: {error.Message}");
+                return false;
+            }
+
+            return result;
+        }
+
         private static bool TryExpand(AutomationElement item)
         {
             if (item.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out var pattern))
@@ -4123,14 +4480,14 @@ internal static class Program
         private static List<UiaRow> ReadPropertyRows(AutomationElement root)
         {
             var rows = new List<UiaRow>();
-            var grid = FindPropertyGrid(root) ?? root;
+            var grid = FindPropertyGrid(root);
+            if (grid == null)
+            {
+                UiaDebug("Property grid not found for current page.");
+                return rows;
+            }
 
-            var rowCondition = new OrCondition(
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.DataItem),
-                new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.ListItem));
-
-            var rowItems = grid.FindAll(TreeScope.Descendants, rowCondition);
-            foreach (AutomationElement row in rowItems)
+            foreach (var row in EnumerateRowItems(grid))
             {
                 if (TryParseRow(row, out var name, out var value, out var valueElement))
                 {
@@ -4139,6 +4496,102 @@ internal static class Program
             }
 
             return rows;
+        }
+
+        private static List<UiaRow> ReadPropertyRowsWithTimeout(AutomationElement root, int timeoutMs)
+        {
+            if (timeoutMs <= 0)
+            {
+                return new List<UiaRow>();
+            }
+
+            List<UiaRow>? result = null;
+            Exception? error = null;
+            var thread = new Thread(() =>
+            {
+                try
+                {
+                    result = ReadPropertyRows(root);
+                }
+                catch (Exception ex)
+                {
+                    error = ex;
+                }
+            })
+            {
+                IsBackground = true
+            };
+
+            try
+            {
+                thread.SetApartmentState(ApartmentState.STA);
+            }
+            catch
+            {
+                // Ignore STA failures.
+            }
+
+            thread.Start();
+            if (!thread.Join(timeoutMs))
+            {
+                UiaDebug("Property grid read timed out.");
+                return new List<UiaRow>();
+            }
+
+            if (error != null)
+            {
+                UiaDebug($"Property grid read failed: {error.Message}");
+                return new List<UiaRow>();
+            }
+
+            return result ?? new List<UiaRow>();
+        }
+
+        private static IEnumerable<AutomationElement> EnumerateRowItems(AutomationElement grid)
+        {
+            const int maxRows = 400;
+            const int maxNodes = 4000;
+            var walker = TreeWalker.ControlViewWalker;
+            var queue = new Queue<AutomationElement>();
+            queue.Enqueue(grid);
+            var visited = 0;
+            var rows = 0;
+
+            while (queue.Count > 0 && visited < maxNodes && rows < maxRows)
+            {
+                var current = queue.Dequeue();
+                visited++;
+
+                var controlType = current.Current.ControlType;
+                if (controlType == ControlType.DataItem || controlType == ControlType.ListItem)
+                {
+                    rows++;
+                    yield return current;
+                }
+
+                AutomationElement? child = null;
+                try
+                {
+                    child = walker.GetFirstChild(current);
+                }
+                catch
+                {
+                    child = null;
+                }
+
+                while (child != null)
+                {
+                    queue.Enqueue(child);
+                    try
+                    {
+                        child = walker.GetNextSibling(child);
+                    }
+                    catch
+                    {
+                        break;
+                    }
+                }
+            }
         }
 
         private static AutomationElement? FindPropertyGrid(AutomationElement root)
