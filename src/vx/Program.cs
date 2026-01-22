@@ -13,6 +13,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows;
 using System.Windows.Automation;
+using System.Xml.Linq;
 using Microsoft.Build.Construction;
 using Microsoft.Build.Evaluation;
 using Microsoft.Build.Locator;
@@ -260,7 +261,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            Console.Error.WriteLine($"Unexpected error: {FormatUnexpectedError(ex)}");
             return 1;
         }
         finally
@@ -366,7 +367,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            Console.Error.WriteLine($"Unexpected error: {FormatUnexpectedError(ex)}");
             return 1;
         }
         finally
@@ -493,7 +494,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            Console.Error.WriteLine($"Unexpected error: {FormatUnexpectedError(ex)}");
             return 1;
         }
         finally
@@ -748,7 +749,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            Console.Error.WriteLine($"Unexpected error: {FormatUnexpectedError(ex)}");
             return 1;
         }
         finally
@@ -806,7 +807,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            Console.Error.WriteLine($"Unexpected error: {FormatUnexpectedError(ex)}");
             return 1;
         }
         finally
@@ -1003,6 +1004,16 @@ internal static class Program
         }
 
         Console.WriteLine($"*update {entry.Name} value:");
+        if (!string.IsNullOrWhiteSpace(entry.Description))
+        {
+            Console.WriteLine($"-info: {entry.Description}");
+        }
+
+        if (entry.AllowedValues != null && entry.AllowedValues.Count > 0)
+        {
+            Console.WriteLine($"-allowed: {string.Join(", ", entry.AllowedValues)}");
+        }
+
         Console.Write("-enter new value ");
         Console.Write($"<{formattedCurrent}> ");
         Console.Write("(use !delete to remove): ");
@@ -1097,6 +1108,22 @@ internal static class Program
     {
         hint = string.Empty;
         converted = input;
+
+        if (entry.AllowedValueMap != null)
+        {
+            var key = input.Trim();
+            if (entry.AllowedValueMap.TryGetValue(key, out var mapped))
+            {
+                converted = mapped;
+                return true;
+            }
+
+            if (entry.AllowedValues != null && entry.AllowedValues.Count > 0)
+            {
+                hint = $"Expected one of: {string.Join(", ", entry.AllowedValues)}";
+                return false;
+            }
+        }
 
         var targetType = currentValue?.GetType() ?? entry.PropertyType ?? entry.Descriptor?.PropertyType;
 
@@ -1226,6 +1253,8 @@ internal static class Program
     private static string? CachedDotnetSdkVersion;
     private static string? CachedDotnetSdkRootPath;
     private static bool NuGetAssembliesEnsured;
+    private static readonly Dictionary<string, List<RuleDefinition>> RuleDefinitionCache = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly object RuleDefinitionLock = new();
 
     private static readonly string[] KnownPropertyPages =
     {
@@ -1266,6 +1295,73 @@ internal static class Program
         "ios/Manifest",
         "ios/On Demand Resources",
         "ios/Run Options"
+    };
+
+    private static readonly string[] IosPropertyNameHints =
+    {
+        "CodesignKey",
+        "CodesignKeychain",
+        "CodesignProvision",
+        "CodesignEntitlements",
+        "CodesignExtraArgs",
+        "DevelopmentTeamId",
+        "ProvisioningType",
+        "BuildIpa",
+        "IpaPackageDir",
+        "IpaPackageName",
+        "IpaPackagePath",
+        "ArchiveOnBuild",
+        "MtouchArch",
+        "MtouchLink",
+        "MtouchDebug",
+        "MtouchSdkVersion",
+        "MtouchUseLlvm",
+        "MtouchUseBitcode",
+        "MtouchNoSymbolStrip",
+        "MtouchExtraArgs",
+        "MtouchEnableSGenConc",
+        "MtouchProfiling",
+        "MtouchFastDev",
+        "MtouchFloat32",
+        "MtouchHttpClientHandlerType",
+        "MtouchTlsProvider",
+        "MtouchInterpreter",
+        "MtouchUseInterpreter",
+        "MtouchEnableBitcode",
+        "DeviceSpecificBuild",
+        "EmbedOnDemandResources",
+        "IOSDebuggerConnectOverUsb",
+        "IOSDebuggerPort",
+        "IOSDebugOverWiFi",
+        "IpaIncludeArtwork",
+        "OnDemandResourcesInitialInstallTags",
+        "OnDemandResourcesPrefetchOrder",
+        "OnDemandResourcesUrl"
+    };
+
+    private static readonly string[] AndroidPropertyNameHints =
+    {
+        "AndroidKeyStore",
+        "AndroidSigningKeyStore",
+        "AndroidSigningKeyAlias",
+        "AndroidSigningKeyPass",
+        "AndroidSigningStorePass",
+        "AndroidUseAapt2",
+        "AndroidPackageFormat",
+        "AndroidManifest",
+        "AndroidLinkMode",
+        "AndroidEnableProfiledAot",
+        "AndroidEnablePreloadAssemblies",
+        "AndroidDexTool",
+        "AndroidDexToolExecutable",
+        "AndroidUseSharedRuntime",
+        "AndroidSdkBuildToolsVersion",
+        "AndroidSdkEmulatorVersion",
+        "AndroidSdkPlatformToolsVersion",
+        "AndroidSdkPlatformVersion",
+        "AndroidNdkVersion",
+        "AndroidUseApkSigner",
+        "AndroidPackageNamingPolicy"
     };
 
     private static readonly HashSet<string> KnownPropertyNames = new(StringComparer.OrdinalIgnoreCase)
@@ -1371,22 +1467,108 @@ internal static class Program
         dynamic? dynamicProject = project;
         MsBuildEvaluation? msbuildEvaluation = null;
         Dictionary<string, MsBuildPropertyValue>? msbuildMap = null;
+        HashSet<string>? platformPropertyNames = null;
+        HashSet<string>? additionalSchemaFiles = null;
         var projectPath = GetProjectPath(dynamicProject);
-        var allowedNames = includeMsBuild && !ShouldIncludeAllMsBuildProperties()
-            ? BuildAllowedMsBuildPropertyNames(projectPath)
-            : null;
+        var fileValues = new Dictionary<string, (string Value, string FilePath)>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(projectPath) && File.Exists(projectPath))
+        {
+            fileValues = CollectPropertyValuesFromProjectFiles(projectPath);
+        }
+
+        var globalProperties = GetMsBuildGlobalProperties(dynamicProject);
+        var targetFrameworks = GetProjectTargetFrameworks((object?)dynamicProject, fileValues);
+        var primaryTargetFramework = targetFrameworks.FirstOrDefault();
+        if (!string.IsNullOrWhiteSpace(primaryTargetFramework))
+        {
+            globalProperties["TargetFramework"] = primaryTargetFramework;
+        }
+
         if (includeMsBuild)
         {
-            msbuildEvaluation = TryCreateMsBuildEvaluation(dynamicProject);
+            msbuildEvaluation = TryCreateMsBuildEvaluation(dynamicProject, globalProperties);
             if (msbuildEvaluation != null)
             {
-                msbuildMap = BuildMsBuildPropertyMap(msbuildEvaluation.Project, allowedNames);
-                AddPropertyPagesFromMsBuild(pages, dynamicProject, msbuildMap);
+                platformPropertyNames = ExtractPlatformPropertyNames(msbuildEvaluation.Project);
+
+                if (targetFrameworks.Count > 1)
+                {
+                    var additionalPlatforms = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    additionalSchemaFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var framework in targetFrameworks)
+                    {
+                        if (string.IsNullOrWhiteSpace(framework) ||
+                            string.Equals(framework, primaryTargetFramework, StringComparison.OrdinalIgnoreCase))
+                        {
+                            continue;
+                        }
+
+                        var globals = new Dictionary<string, string>(globalProperties, StringComparer.OrdinalIgnoreCase)
+                        {
+                            ["TargetFramework"] = framework
+                        };
+
+                        using var eval = TryCreateMsBuildEvaluation(dynamicProject, globals);
+                        if (eval == null)
+                        {
+                            continue;
+                        }
+
+                        foreach (var schema in GetPropertyPageSchemaFiles(eval.Project))
+                        {
+                            additionalSchemaFiles.Add(schema);
+                        }
+
+                        foreach (var name in ExtractPlatformPropertyNames(eval.Project))
+                        {
+                            additionalPlatforms.Add(name);
+                        }
+                    }
+
+                    if (additionalSchemaFiles.Count == 0)
+                    {
+                        additionalSchemaFiles = null;
+                    }
+
+                    if (additionalPlatforms.Count > 0)
+                    {
+                        if (platformPropertyNames == null)
+                        {
+                            platformPropertyNames = additionalPlatforms;
+                        }
+                        else
+                        {
+                            foreach (var name in additionalPlatforms)
+                            {
+                                platformPropertyNames.Add(name);
+                            }
+                        }
+                    }
+                }
             }
-            else if (!string.IsNullOrWhiteSpace(projectPath) && File.Exists(projectPath))
-            {
-                AddPropertyPagesFromProjectFilesFallback(pages, projectPath);
-            }
+        }
+
+        var ruleDefinitions = LoadRuleDefinitions(projectPath, msbuildEvaluation?.Project, additionalSchemaFiles);
+
+        if (includeMsBuild && msbuildEvaluation != null)
+        {
+            var allowedNames = ShouldIncludeAllMsBuildProperties()
+                ? null
+                : BuildAllowedMsBuildPropertyNames(projectPath, ruleDefinitions, platformPropertyNames);
+            msbuildMap = BuildMsBuildPropertyMap(msbuildEvaluation.Project, allowedNames);
+        }
+
+        AddPropertyPagesFromRules(pages, ruleDefinitions, msbuildMap, fileValues, projectPath, globalProperties);
+        AddPropertyPagesFromPlatformDefinitions(pages, platformPropertyNames, msbuildMap, fileValues, projectPath, globalProperties);
+
+        if (includeMsBuild && ShouldIncludeAllMsBuildProperties() && msbuildMap != null)
+        {
+            AddPropertyPagesFromMsBuild(pages, dynamicProject, msbuildMap);
+        }
+        else if (!string.IsNullOrWhiteSpace(projectPath) && File.Exists(projectPath))
+        {
+            AddPropertyPagesFromProjectFilesFallback(pages, projectPath);
         }
 
         AddPropertyPagesFromUserFile(pages, projectPath);
@@ -1424,9 +1606,31 @@ internal static class Program
                string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static HashSet<string>? BuildAllowedMsBuildPropertyNames(string? projectPath)
+    private static HashSet<string>? BuildAllowedMsBuildPropertyNames(string? projectPath, List<RuleDefinition> ruleDefinitions, HashSet<string>? platformPropertyNames)
     {
         var allowed = new HashSet<string>(KnownPropertyNames, StringComparer.OrdinalIgnoreCase);
+
+        foreach (var rule in ruleDefinitions)
+        {
+            foreach (var property in rule.Properties)
+            {
+                if (!string.IsNullOrWhiteSpace(property.Name))
+                {
+                    allowed.Add(property.Name);
+                }
+            }
+        }
+
+        if (platformPropertyNames != null)
+        {
+            foreach (var name in platformPropertyNames)
+            {
+                if (!string.IsNullOrWhiteSpace(name))
+                {
+                    allowed.Add(name);
+                }
+            }
+        }
 
         if (string.IsNullOrWhiteSpace(projectPath) || !File.Exists(projectPath))
         {
@@ -1451,6 +1655,914 @@ internal static class Program
         }
 
         return allowed;
+    }
+
+    private static List<RuleDefinition> LoadStaticRuleDefinitions(string? projectPath)
+    {
+        var cacheKey = BuildRuleDefinitionCacheKey(projectPath);
+        lock (RuleDefinitionLock)
+        {
+            if (RuleDefinitionCache.TryGetValue(cacheKey, out var cached))
+            {
+                return cached;
+            }
+        }
+
+        var rules = new List<RuleDefinition>();
+        var ruleFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var targetFile in GetPropertyPageSchemaTargetFiles(projectPath))
+        {
+            foreach (var schemaFile in GetPropertyPageSchemaFiles(targetFile))
+            {
+                if (File.Exists(schemaFile))
+                {
+                    ruleFiles.Add(schemaFile);
+                }
+            }
+        }
+
+        foreach (var ruleFile in ruleFiles)
+        {
+            var rule = ParseRuleDefinition(ruleFile);
+            if (rule != null)
+            {
+                rules.Add(rule);
+            }
+        }
+
+        lock (RuleDefinitionLock)
+        {
+            RuleDefinitionCache[cacheKey] = rules;
+        }
+
+        return rules;
+    }
+
+    private static List<RuleDefinition> LoadRuleDefinitions(string? projectPath, Project? msbuildProject, IEnumerable<string>? extraRuleFiles)
+    {
+        if (msbuildProject == null && (extraRuleFiles == null || !extraRuleFiles.Any()))
+        {
+            return LoadStaticRuleDefinitions(projectPath);
+        }
+
+        var ruleFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var targetFile in GetPropertyPageSchemaTargetFiles(projectPath))
+        {
+            foreach (var schemaFile in GetPropertyPageSchemaFiles(targetFile))
+            {
+                if (File.Exists(schemaFile))
+                {
+                    ruleFiles.Add(schemaFile);
+                }
+            }
+        }
+
+        if (msbuildProject != null)
+        {
+            foreach (var schemaFile in GetPropertyPageSchemaFiles(msbuildProject))
+            {
+                if (File.Exists(schemaFile))
+                {
+                    ruleFiles.Add(schemaFile);
+                }
+            }
+        }
+
+        if (extraRuleFiles != null)
+        {
+            foreach (var schemaFile in extraRuleFiles)
+            {
+                if (File.Exists(schemaFile))
+                {
+                    ruleFiles.Add(schemaFile);
+                }
+            }
+        }
+
+        var rules = new List<RuleDefinition>();
+        foreach (var ruleFile in ruleFiles)
+        {
+            var rule = ParseRuleDefinition(ruleFile);
+            if (rule != null)
+            {
+                rules.Add(rule);
+            }
+        }
+
+        return rules;
+    }
+
+    private static string BuildRuleDefinitionCacheKey(string? projectPath)
+    {
+        var language = GetProjectLanguage(projectPath);
+        var vsRoot = GetVisualStudioRoot() ?? string.Empty;
+        var sdkRoot = CachedDotnetSdkRootPath ?? string.Empty;
+        return $"{language}|{vsRoot}|{sdkRoot}";
+    }
+
+    private static string GetProjectLanguage(string? projectPath)
+    {
+        if (string.IsNullOrWhiteSpace(projectPath))
+        {
+            return "Unknown";
+        }
+
+        var ext = Path.GetExtension(projectPath);
+        if (string.Equals(ext, ".csproj", StringComparison.OrdinalIgnoreCase))
+        {
+            return "CSharp";
+        }
+
+        if (string.Equals(ext, ".vbproj", StringComparison.OrdinalIgnoreCase))
+        {
+            return "VisualBasic";
+        }
+
+        if (string.Equals(ext, ".fsproj", StringComparison.OrdinalIgnoreCase))
+        {
+            return "FSharp";
+        }
+
+        return "Unknown";
+    }
+
+    private static IEnumerable<string> GetPropertyPageSchemaTargetFiles(string? projectPath)
+    {
+        var vsRoot = GetVisualStudioRoot();
+        if (!string.IsNullOrWhiteSpace(vsRoot))
+        {
+            var managedRoot = Path.Combine(vsRoot, "MSBuild", "Microsoft", "VisualStudio", "Managed");
+            var managedTargets = Path.Combine(managedRoot, "Microsoft.Managed.DesignTime.targets");
+            if (File.Exists(managedTargets))
+            {
+                yield return managedTargets;
+            }
+
+            var language = GetProjectLanguage(projectPath);
+            if (string.Equals(language, "CSharp", StringComparison.OrdinalIgnoreCase))
+            {
+                var csharpTargets = Path.Combine(managedRoot, "Microsoft.CSharp.DesignTime.targets");
+                if (File.Exists(csharpTargets))
+                {
+                    yield return csharpTargets;
+                }
+            }
+            else if (string.Equals(language, "VisualBasic", StringComparison.OrdinalIgnoreCase))
+            {
+                var vbTargets = Path.Combine(managedRoot, "Microsoft.VisualBasic.DesignTime.targets");
+                if (File.Exists(vbTargets))
+                {
+                    yield return vbTargets;
+                }
+            }
+            else if (string.Equals(language, "FSharp", StringComparison.OrdinalIgnoreCase))
+            {
+                var fsTargets = Path.Combine(managedRoot, "Microsoft.FSharp.DesignTime.targets");
+                if (File.Exists(fsTargets))
+                {
+                    yield return fsTargets;
+                }
+            }
+
+            var mauiTargets = Path.Combine(vsRoot, "MSBuild", "Microsoft", "VisualStudio", "Maui", "Maui.DesignTime.targets");
+            if (File.Exists(mauiTargets))
+            {
+                yield return mauiTargets;
+            }
+
+            var msbuildCurrentBin = Path.Combine(vsRoot, "MSBuild", "Current", "Bin");
+            var commonTargets = Path.Combine(msbuildCurrentBin, "Microsoft.Common.CurrentVersion.targets");
+            if (File.Exists(commonTargets))
+            {
+                yield return commonTargets;
+            }
+
+            var csharpCurrentTargets = Path.Combine(msbuildCurrentBin, "Microsoft.CSharp.CurrentVersion.targets");
+            if (File.Exists(csharpCurrentTargets))
+            {
+                yield return csharpCurrentTargets;
+            }
+
+            var vbCurrentTargets = Path.Combine(msbuildCurrentBin, "Microsoft.VisualBasic.CurrentVersion.targets");
+            if (File.Exists(vbCurrentTargets))
+            {
+                yield return vbCurrentTargets;
+            }
+
+            var fsCurrentTargets = Path.Combine(msbuildCurrentBin, "Microsoft.FSharp.CurrentVersion.targets");
+            if (File.Exists(fsCurrentTargets))
+            {
+                yield return fsCurrentTargets;
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetPropertyPageSchemaFiles(string targetFile)
+    {
+        ProjectRootElement? root;
+        try
+        {
+            root = ProjectRootElement.Open(targetFile);
+        }
+        catch
+        {
+            yield break;
+        }
+
+        if (root == null)
+        {
+            yield break;
+        }
+
+        var properties = BuildPropertyPageSchemaProperties(targetFile);
+        foreach (var item in root.Items)
+        {
+            if (!string.Equals(item.ItemType, "PropertyPageSchema", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            if (!ShouldIncludePropertyPageSchemaItem(item))
+            {
+                continue;
+            }
+
+            foreach (var include in item.Include.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var resolved = ExpandPropertyPageSchemaPath(include.Trim(), targetFile, properties);
+                if (!string.IsNullOrWhiteSpace(resolved))
+                {
+                    yield return resolved;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> GetPropertyPageSchemaFiles(Project msbuildProject)
+    {
+        if (msbuildProject == null)
+        {
+            yield break;
+        }
+
+        foreach (var item in msbuildProject.GetItems("PropertyPageSchema"))
+        {
+            if (!ShouldIncludePropertyPageSchemaItem(item))
+            {
+                continue;
+            }
+
+            var include = item.EvaluatedInclude;
+            if (string.IsNullOrWhiteSpace(include))
+            {
+                continue;
+            }
+
+            foreach (var part in include.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var resolved = ResolvePropertyPageSchemaPath(part, msbuildProject.DirectoryPath);
+                if (!string.IsNullOrWhiteSpace(resolved))
+                {
+                    yield return resolved;
+                }
+            }
+        }
+    }
+
+    private static bool ShouldIncludePropertyPageSchemaItem(ProjectItem item)
+    {
+        var context = item.GetMetadataValue("Context");
+        if (string.IsNullOrWhiteSpace(context))
+        {
+            return false;
+        }
+
+        var tokens = context
+            .Split(';', StringSplitOptions.RemoveEmptyEntries)
+            .Select(token => token.Trim())
+            .Where(token => !string.IsNullOrWhiteSpace(token))
+            .ToArray();
+
+        if (tokens.Length == 0)
+        {
+            return false;
+        }
+
+        var hasProject = tokens.Any(token =>
+            string.Equals(token, "Project", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(token, "ProjectConfiguration", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(token, "Configuration", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(token, "PropertySheet", StringComparison.OrdinalIgnoreCase));
+
+        if (!hasProject)
+        {
+            return false;
+        }
+
+        if (tokens.Any(token =>
+                token.Contains("BrowseObject", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(token, "File", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(token, "ProjectSubscriptionService", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(token, "ConfiguredBrowseObject", StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static bool ShouldIncludePropertyPageSchemaItem(ProjectItemElement item)
+    {
+        if (item == null)
+        {
+            return false;
+        }
+
+        var context = item.Metadata
+            .FirstOrDefault(metadata => string.Equals(metadata.Name, "Context", StringComparison.OrdinalIgnoreCase))
+            ?.Value;
+
+        if (string.IsNullOrWhiteSpace(context))
+        {
+            return false;
+        }
+
+        var tokens = context
+            .Split(';', StringSplitOptions.RemoveEmptyEntries)
+            .Select(token => token.Trim())
+            .Where(token => !string.IsNullOrWhiteSpace(token))
+            .ToArray();
+
+        if (tokens.Length == 0)
+        {
+            return false;
+        }
+
+        var hasProject = tokens.Any(token =>
+            string.Equals(token, "Project", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(token, "ProjectConfiguration", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(token, "Configuration", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(token, "PropertySheet", StringComparison.OrdinalIgnoreCase));
+
+        if (!hasProject)
+        {
+            return false;
+        }
+
+        if (tokens.Any(token =>
+                token.Contains("BrowseObject", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(token, "File", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(token, "ProjectSubscriptionService", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(token, "ConfiguredBrowseObject", StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    private static string? ResolvePropertyPageSchemaPath(string include, string? baseDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(include))
+        {
+            return null;
+        }
+
+        var trimmed = include.Trim();
+        if (!Path.IsPathRooted(trimmed) && !string.IsNullOrWhiteSpace(baseDirectory))
+        {
+            trimmed = Path.Combine(baseDirectory, trimmed);
+        }
+
+        try
+        {
+            return Path.GetFullPath(trimmed);
+        }
+        catch
+        {
+            return trimmed;
+        }
+    }
+
+    private static Dictionary<string, string> BuildPropertyPageSchemaProperties(string targetFile)
+    {
+        var properties = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["MSBuildThisFileDirectory"] = EnsureTrailingSlash(Path.GetDirectoryName(targetFile))
+        };
+
+        var directory = Path.GetDirectoryName(targetFile);
+        if (!string.IsNullOrWhiteSpace(directory) &&
+            directory.EndsWith(Path.Combine("VisualStudio", "Managed"), StringComparison.OrdinalIgnoreCase))
+        {
+            var neutral = EnsureTrailingSlash(directory);
+            properties["ManagedXamlNeutralResourcesDirectory"] = neutral;
+            properties["ManagedXamlResourcesDirectory"] = ResolveManagedXamlResourcesDirectory(neutral);
+        }
+
+        if (!string.IsNullOrWhiteSpace(CachedDotnetSdksPath))
+        {
+            properties["MSBuildSDKsPath"] = EnsureTrailingSlash(CachedDotnetSdksPath);
+        }
+
+        return properties;
+    }
+
+    private static string? ExpandPropertyPageSchemaPath(string include, string targetFile, Dictionary<string, string> properties)
+    {
+        if (string.IsNullOrWhiteSpace(include))
+        {
+            return null;
+        }
+
+        var expanded = ReplacePropertyTokens(include, properties, targetFile);
+        if (string.IsNullOrWhiteSpace(expanded))
+        {
+            return null;
+        }
+
+        var trimmed = expanded.Trim();
+        if (!Path.IsPathRooted(trimmed))
+        {
+            var baseDir = Path.GetDirectoryName(targetFile);
+            if (!string.IsNullOrWhiteSpace(baseDir))
+            {
+                trimmed = Path.Combine(baseDir, trimmed);
+            }
+        }
+
+        try
+        {
+            return Path.GetFullPath(trimmed);
+        }
+        catch
+        {
+            return trimmed;
+        }
+    }
+
+    private static string ReplacePropertyTokens(string value, Dictionary<string, string> properties, string targetFile)
+    {
+        return Regex.Replace(value, "\\$\\(([^)]+)\\)", match =>
+        {
+            var key = match.Groups[1].Value;
+            if (string.Equals(key, "MSBuildThisFileDirectory", StringComparison.OrdinalIgnoreCase))
+            {
+                return EnsureTrailingSlash(Path.GetDirectoryName(targetFile));
+            }
+
+            if (properties.TryGetValue(key, out var replacement))
+            {
+                return replacement;
+            }
+
+            return match.Value;
+        }, RegexOptions.IgnoreCase);
+    }
+
+    private static string ResolveManagedXamlResourcesDirectory(string neutralDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(neutralDirectory))
+        {
+            return string.Empty;
+        }
+
+        return EnsureTrailingSlash(neutralDirectory);
+    }
+
+    private static string EnsureTrailingSlash(string? path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return string.Empty;
+        }
+
+        if (path.EndsWith(Path.DirectorySeparatorChar) || path.EndsWith(Path.AltDirectorySeparatorChar))
+        {
+            return path;
+        }
+
+        return path + Path.DirectorySeparatorChar;
+    }
+
+    private static RuleDefinition? ParseRuleDefinition(string ruleFile)
+    {
+        try
+        {
+            var doc = XDocument.Load(ruleFile);
+            var ruleElement = doc.Root;
+            if (ruleElement == null || !string.Equals(ruleElement.Name.LocalName, "Rule", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            var name = ruleElement.Attribute("Name")?.Value;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                name = Path.GetFileNameWithoutExtension(ruleFile);
+            }
+
+            var displayName = ruleElement.Attribute("DisplayName")?.Value;
+            if (string.IsNullOrWhiteSpace(displayName))
+            {
+                displayName = name;
+            }
+
+            var rule = new RuleDefinition(name, displayName)
+            {
+                Description = ruleElement.Attribute("Description")?.Value,
+                AppliesTo = ruleElement.Attribute("AppliesTo")?.Value,
+                PageTemplate = ruleElement.Attribute("PageTemplate")?.Value
+            };
+
+            var categoriesElement = ruleElement.Elements()
+                .FirstOrDefault(element => string.Equals(element.Name.LocalName, "Rule.Categories", StringComparison.OrdinalIgnoreCase));
+            if (categoriesElement != null)
+            {
+                foreach (var categoryElement in categoriesElement.Elements()
+                             .Where(element => string.Equals(element.Name.LocalName, "Category", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var categoryName = categoryElement.Attribute("Name")?.Value ?? string.Empty;
+                    if (string.IsNullOrWhiteSpace(categoryName))
+                    {
+                        continue;
+                    }
+
+                    var categoryDisplay = categoryElement.Attribute("DisplayName")?.Value ?? categoryName;
+                    var category = new RuleCategoryDefinition(categoryName, categoryDisplay)
+                    {
+                        Description = categoryElement.Attribute("Description")?.Value
+                    };
+                    rule.Categories[categoryName] = category;
+                }
+            }
+
+            var ruleDataSource = ruleElement.Elements()
+                .FirstOrDefault(element => string.Equals(element.Name.LocalName, "Rule.DataSource", StringComparison.OrdinalIgnoreCase));
+            var dataSourceElement = ruleDataSource?.Elements()
+                .FirstOrDefault(element => string.Equals(element.Name.LocalName, "DataSource", StringComparison.OrdinalIgnoreCase));
+            if (dataSourceElement != null)
+            {
+                rule.DataSourcePersistence = dataSourceElement.Attribute("Persistence")?.Value;
+                rule.DataSourceItemType = dataSourceElement.Attribute("ItemType")?.Value;
+            }
+
+            foreach (var propElement in ruleElement.Elements()
+                         .Where(element => element.Name.LocalName.EndsWith("Property", StringComparison.OrdinalIgnoreCase)))
+            {
+                var propName = propElement.Attribute("Name")?.Value;
+                if (string.IsNullOrWhiteSpace(propName))
+                {
+                    continue;
+                }
+
+                var propDisplayName = propElement.Attribute("DisplayName")?.Value;
+                if (string.IsNullOrWhiteSpace(propDisplayName))
+                {
+                    propDisplayName = propName;
+                }
+
+                var propDef = new RulePropertyDefinition(propName, propDisplayName)
+                {
+                    Description = propElement.Attribute("Description")?.Value,
+                    Category = propElement.Attribute("Category")?.Value,
+                    PropertyKind = propElement.Name.LocalName
+                };
+
+                if (!string.IsNullOrWhiteSpace(propDef.Category) &&
+                    rule.Categories.TryGetValue(propDef.Category, out var category))
+                {
+                    propDef.CategoryDisplayName = category.DisplayName;
+                }
+                else if (!string.IsNullOrWhiteSpace(propDef.Category))
+                {
+                    propDef.CategoryDisplayName = propDef.Category;
+                }
+
+                var visibleValue = propElement.Attribute("Visible")?.Value;
+                if (!string.IsNullOrWhiteSpace(visibleValue) &&
+                    string.Equals(visibleValue, "False", StringComparison.OrdinalIgnoreCase))
+                {
+                    propDef.Visible = false;
+                }
+
+                var propDataSource = propElement.Elements()
+                    .FirstOrDefault(element => element.Name.LocalName.EndsWith(".DataSource", StringComparison.OrdinalIgnoreCase));
+                var propDataSourceElement = propDataSource?.Elements()
+                    .FirstOrDefault(element => string.Equals(element.Name.LocalName, "DataSource", StringComparison.OrdinalIgnoreCase));
+                if (propDataSourceElement != null)
+                {
+                    propDef.DataSourcePersistence = propDataSourceElement.Attribute("Persistence")?.Value;
+                    propDef.DataSourceItemType = propDataSourceElement.Attribute("ItemType")?.Value;
+                    propDef.PersistedName = propDataSourceElement.Attribute("PersistedName")?.Value;
+                }
+                else
+                {
+                    propDef.DataSourcePersistence ??= rule.DataSourcePersistence;
+                    propDef.DataSourceItemType ??= rule.DataSourceItemType;
+                }
+
+                foreach (var enumElement in propElement.Descendants()
+                             .Where(element => string.Equals(element.Name.LocalName, "EnumValue", StringComparison.OrdinalIgnoreCase)))
+                {
+                    var enumName = enumElement.Attribute("Name")?.Value;
+                    if (string.IsNullOrWhiteSpace(enumName))
+                    {
+                        continue;
+                    }
+
+                    var enumDisplay = enumElement.Attribute("DisplayName")?.Value ?? enumName;
+                    propDef.EnumValues.Add(enumDisplay);
+                    propDef.EnumValueMap[enumDisplay] = enumName;
+                    propDef.EnumValueMap[enumName] = enumName;
+                }
+
+                rule.Properties.Add(propDef);
+            }
+
+            return rule;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void AddPropertyPagesFromRules(
+        List<PropertyPage> pages,
+        List<RuleDefinition> ruleDefinitions,
+        Dictionary<string, MsBuildPropertyValue>? msbuildMap,
+        Dictionary<string, (string Value, string FilePath)> fileValues,
+        string? projectPath,
+        IDictionary<string, string> globalProperties)
+    {
+        foreach (var rule in ruleDefinitions)
+        {
+            foreach (var prop in rule.Properties)
+            {
+                if (!prop.Visible && !ShouldIncludeAllMsBuildProperties())
+                {
+                    continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(prop.DataSourceItemType))
+                {
+                    continue;
+                }
+
+                var pageName = GetRulePropertyPageName(rule, prop);
+                var persistedName = GetPersistedPropertyName(prop);
+
+                object? Getter()
+                {
+                    return GetPropertyValueFromMaps(persistedName, msbuildMap, fileValues);
+                }
+
+                Action<object?>? setter = BuildRulePropertySetter(prop, projectPath, globalProperties);
+                var entry = new PropertyEntry(prop.DisplayName, persistedName, pageName, Getter, setter, InferPropertyTypeFromRule(prop), PropertySource.MsBuild)
+                {
+                    Description = prop.Description
+                };
+
+                if (prop.EnumValues.Count > 0)
+                {
+                    entry.AllowedValues = prop.EnumValues;
+                    entry.AllowedValueMap = prop.EnumValueMap;
+                }
+
+                var deleteAction = BuildRulePropertyDeleteAction(prop, projectPath, globalProperties);
+                if (deleteAction != null)
+                {
+                    entry.DeleteAction = deleteAction;
+                }
+
+                AddPropertyEntry(pages, pageName, entry);
+            }
+        }
+    }
+
+    private static void AddPropertyPagesFromPlatformDefinitions(
+        List<PropertyPage> pages,
+        HashSet<string>? platformPropertyNames,
+        Dictionary<string, MsBuildPropertyValue>? msbuildMap,
+        Dictionary<string, (string Value, string FilePath)> fileValues,
+        string? projectPath,
+        IDictionary<string, string> globalProperties)
+    {
+        if (platformPropertyNames == null || platformPropertyNames.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var name in platformPropertyNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase))
+        {
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            var pageName = MapPropertyPageName(string.Empty, name);
+            var persistedName = name;
+
+            object? Getter()
+            {
+                return GetPropertyValueFromMaps(persistedName, msbuildMap, fileValues);
+            }
+
+            var setter = BuildDefaultPropertySetter(persistedName, projectPath, globalProperties);
+            var rawValue = GetPropertyValueFromMaps(persistedName, msbuildMap, fileValues);
+            var entry = new PropertyEntry(persistedName, persistedName, pageName, Getter, setter, InferMsBuildPropertyType(rawValue?.ToString()), PropertySource.MsBuild);
+
+            var deleteAction = BuildDefaultPropertyDeleteAction(persistedName, projectPath, globalProperties);
+            if (deleteAction != null)
+            {
+                entry.DeleteAction = deleteAction;
+            }
+
+            AddPropertyEntry(pages, pageName, entry);
+        }
+    }
+
+    private static string GetRulePropertyPageName(RuleDefinition rule, RulePropertyDefinition prop)
+    {
+        var baseName = string.IsNullOrWhiteSpace(rule.DisplayName) ? rule.Name : rule.DisplayName;
+        var category = prop.CategoryDisplayName ?? prop.Category;
+        if (string.IsNullOrWhiteSpace(category))
+        {
+            return NormalizePageName(baseName);
+        }
+
+        return NormalizePageName($"{baseName}/{category}");
+    }
+
+    private static string GetPersistedPropertyName(RulePropertyDefinition prop)
+    {
+        if (!string.IsNullOrWhiteSpace(prop.PersistedName))
+        {
+            return prop.PersistedName;
+        }
+
+        return prop.Name;
+    }
+
+    private static object? GetPropertyValueFromMaps(
+        string propertyName,
+        Dictionary<string, MsBuildPropertyValue>? msbuildMap,
+        Dictionary<string, (string Value, string FilePath)> fileValues)
+    {
+        if (string.IsNullOrWhiteSpace(propertyName))
+        {
+            return null;
+        }
+
+        var key = NormalizePropertyKey(propertyName);
+        if (msbuildMap != null && msbuildMap.TryGetValue(key, out var value))
+        {
+            return value.Value;
+        }
+
+        if (fileValues.TryGetValue(propertyName, out var fileValue))
+        {
+            return fileValue.Value;
+        }
+
+        return null;
+    }
+
+    private static Action<object?>? BuildRulePropertySetter(RulePropertyDefinition prop, string? projectPath, IDictionary<string, string> globalProperties)
+    {
+        if (string.IsNullOrWhiteSpace(projectPath))
+        {
+            return null;
+        }
+
+        var persistence = prop.DataSourcePersistence ?? string.Empty;
+        var propertyName = GetPersistedPropertyName(prop);
+
+        if (string.Equals(persistence, "UserFile", StringComparison.OrdinalIgnoreCase))
+        {
+            var userFile = projectPath + ".user";
+            return value =>
+            {
+                var text = value?.ToString() ?? string.Empty;
+                SetPropertyInMsBuildFile(userFile, propertyName, text);
+            };
+        }
+
+        return value => SetMsBuildProperty(projectPath, globalProperties, propertyName, value);
+    }
+
+    private static Func<(bool Success, string? Message)>? BuildRulePropertyDeleteAction(RulePropertyDefinition prop, string? projectPath, IDictionary<string, string> globalProperties)
+    {
+        if (string.IsNullOrWhiteSpace(projectPath))
+        {
+            return null;
+        }
+
+        var persistence = prop.DataSourcePersistence ?? string.Empty;
+        var propertyName = GetPersistedPropertyName(prop);
+
+        if (string.Equals(persistence, "UserFile", StringComparison.OrdinalIgnoreCase))
+        {
+            var userFile = projectPath + ".user";
+            return () =>
+            {
+                var success = RemovePropertyFromMsBuildFile(userFile, propertyName, out var message);
+                return (success, message);
+            };
+        }
+
+        return () =>
+        {
+            var success = RemoveMsBuildProperty(projectPath, globalProperties, propertyName, out var message);
+            return (success, message);
+        };
+    }
+
+    private static Action<object?>? BuildDefaultPropertySetter(string propertyName, string? projectPath, IDictionary<string, string> globalProperties)
+    {
+        if (string.IsNullOrWhiteSpace(projectPath))
+        {
+            return null;
+        }
+
+        return value => SetMsBuildProperty(projectPath, globalProperties, propertyName, value);
+    }
+
+    private static Func<(bool Success, string? Message)>? BuildDefaultPropertyDeleteAction(string propertyName, string? projectPath, IDictionary<string, string> globalProperties)
+    {
+        if (string.IsNullOrWhiteSpace(projectPath))
+        {
+            return null;
+        }
+
+        return () =>
+        {
+            var success = RemoveMsBuildProperty(projectPath, globalProperties, propertyName, out var message);
+            return (success, message);
+        };
+    }
+
+    private static Type InferPropertyTypeFromRule(RulePropertyDefinition prop)
+    {
+        if (prop.PropertyKind == null)
+        {
+            return typeof(string);
+        }
+
+        var kind = prop.PropertyKind;
+        if (kind.EndsWith("BoolProperty", StringComparison.OrdinalIgnoreCase))
+        {
+            return typeof(bool);
+        }
+
+        if (kind.EndsWith("IntProperty", StringComparison.OrdinalIgnoreCase))
+        {
+            return typeof(int);
+        }
+
+        return typeof(string);
+    }
+
+    private static HashSet<string> ExtractPlatformPropertyNames(Project msbuildProject)
+    {
+        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var prop in msbuildProject.AllEvaluatedProperties)
+        {
+            var name = prop.Name;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            if (prop.IsEnvironmentProperty || prop.IsReservedProperty)
+            {
+                continue;
+            }
+
+            if (!ShouldIncludeMsBuildProperty(name))
+            {
+                continue;
+            }
+
+            if (IsPlatformSpecificPropertyName(name))
+            {
+                result.Add(name);
+            }
+        }
+
+        foreach (var hint in IosPropertyNameHints)
+        {
+            result.Add(hint);
+        }
+
+        foreach (var hint in AndroidPropertyNameHints)
+        {
+            result.Add(hint);
+        }
+
+        return result;
     }
 
     private static void AddPropertyPagesFromObject(List<PropertyPage> pages, object? target, Dictionary<string, MsBuildPropertyValue>? msbuildMap, MsBuildEvaluation? msbuildEvaluation)
@@ -1817,6 +2929,84 @@ internal static class Program
         return path;
     }
 
+    private static List<string> GetProjectTargetFrameworks(object? project, Dictionary<string, (string Value, string FilePath)> fileValues)
+    {
+        var result = new List<string>();
+        dynamic? dynamicProject = project;
+
+        AddTargetFramework(result, TryGetActiveConfigurationPropertyValue(dynamicProject, "TargetFramework"));
+        AddTargetFramework(result, TryGetProjectPropertyValue(dynamicProject, "TargetFramework"));
+        AddTargetFramework(result, GetFilePropertyValue(fileValues, "TargetFramework"));
+
+        var targetFrameworks = TryGetActiveConfigurationPropertyValue(dynamicProject, "TargetFrameworks")
+            ?? TryGetProjectPropertyValue(dynamicProject, "TargetFrameworks")
+            ?? GetFilePropertyValue(fileValues, "TargetFrameworks");
+
+        AddTargetFrameworks(result, targetFrameworks);
+
+        return result
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim())
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static void AddTargetFramework(List<string> list, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        list.Add(value.Trim());
+    }
+
+    private static void AddTargetFrameworks(List<string> list, string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return;
+        }
+
+        foreach (var part in value.Split(';', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmed = part.Trim();
+            if (!string.IsNullOrWhiteSpace(trimmed))
+            {
+                list.Add(trimmed);
+            }
+        }
+    }
+
+    private static string? GetFilePropertyValue(Dictionary<string, (string Value, string FilePath)> fileValues, string name)
+    {
+        if (fileValues.Count == 0)
+        {
+            return null;
+        }
+
+        if (fileValues.TryGetValue(name, out var entry))
+        {
+            return entry.Value;
+        }
+
+        return null;
+    }
+
+    private static string? TryGetActiveConfigurationPropertyValue(dynamic project, string propertyName)
+    {
+        var configManager = TryGetValue(() => (dynamic)project?.ConfigurationManager);
+        var activeConfig = TryGetValue(() => (dynamic)configManager?.ActiveConfiguration);
+        var props = TryGetValue(() => (dynamic)activeConfig?.Properties);
+        var prop = TryGetValue(() => (dynamic)props?.Item(propertyName));
+        if (prop == null)
+        {
+            return null;
+        }
+
+        return TryGetValue(() => (string?)prop.Value);
+    }
+
     private static string? TryGetProjectPropertyValue(dynamic project, string propertyName)
     {
         var props = TryGetValue(() => (dynamic)project?.Properties);
@@ -1924,7 +3114,7 @@ internal static class Program
         return group ?? root.AddPropertyGroup();
     }
 
-    private static MsBuildEvaluation? TryCreateMsBuildEvaluation(dynamic project)
+    private static MsBuildEvaluation? TryCreateMsBuildEvaluation(dynamic project, IDictionary<string, string>? globalPropertiesOverride)
     {
         var projectPath = TryGetValue(() => (string?)project.FullName)
             ?? TryGetValue(() => (string?)project.FileName);
@@ -1934,7 +3124,9 @@ internal static class Program
             return null;
         }
 
-        var globalProperties = GetMsBuildGlobalProperties(project);
+        var globalProperties = globalPropertiesOverride != null
+            ? new Dictionary<string, string>(globalPropertiesOverride, StringComparer.OrdinalIgnoreCase)
+            : GetMsBuildGlobalProperties(project);
 
         try
         {
@@ -1969,12 +3161,7 @@ internal static class Program
                 continue;
             }
 
-            if (!ShouldIncludeMsBuildProperty(name))
-            {
-                continue;
-            }
-
-            if (allowedNames != null && !allowedNames.Contains(name))
+            if (!ShouldIncludeMsBuildPropertyName(name, allowedNames))
             {
                 continue;
             }
@@ -2525,6 +3712,24 @@ internal static class Program
                string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsDebugStackEnabled()
+    {
+        var value = Environment.GetEnvironmentVariable("VX_DEBUG_STACK");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string FormatUnexpectedError(Exception ex)
+    {
+        return IsDebugStackEnabled() ? ex.ToString() : ex.Message;
+    }
+
     private static int GetUiaTimeoutMs(string envName, int defaultValue)
     {
         var value = Environment.GetEnvironmentVariable(envName);
@@ -2698,6 +3903,13 @@ internal static class Program
         }
     }
 
+    private static string? GetVisualStudioRoot()
+    {
+        return GetCandidateVisualStudioRoots()
+            .OrderBy(path => IsPrereleasePath(path))
+            .FirstOrDefault();
+    }
+
     private static bool TryRunProcess(string fileName, string arguments, out string stdout, out string stderr)
     {
         stdout = string.Empty;
@@ -2812,6 +4024,13 @@ internal static class Program
             globals["MSBuildSDKsPath"] = CachedDotnetSdksPath;
         }
 
+        if (!globals.ContainsKey("VisualStudioVersion"))
+        {
+            var vsVersion = TryGetValue(() => (string?)project?.DTE?.Version);
+            var normalized = NormalizeVisualStudioVersion(vsVersion);
+            globals["VisualStudioVersion"] = string.IsNullOrWhiteSpace(normalized) ? "17.0" : normalized;
+        }
+
         return globals;
     }
 
@@ -2854,6 +4073,27 @@ internal static class Program
         return platform;
     }
 
+    private static string? NormalizeVisualStudioVersion(string? version)
+    {
+        if (string.IsNullOrWhiteSpace(version))
+        {
+            return null;
+        }
+
+        var parts = version.Split('.', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length >= 2)
+        {
+            return $"{parts[0]}.{parts[1]}";
+        }
+
+        if (parts.Length == 1)
+        {
+            return $"{parts[0]}.0";
+        }
+
+        return null;
+    }
+
     private static bool ShouldIncludeMsBuildProperty(string name)
     {
         if (string.IsNullOrWhiteSpace(name))
@@ -2872,6 +4112,26 @@ internal static class Program
         }
 
         return true;
+    }
+
+    private static bool ShouldIncludeMsBuildPropertyName(string name, HashSet<string>? allowedNames)
+    {
+        if (!ShouldIncludeMsBuildProperty(name))
+        {
+            return false;
+        }
+
+        if (ShouldIncludeAllMsBuildProperties())
+        {
+            return true;
+        }
+
+        if (allowedNames != null && allowedNames.Contains(name))
+        {
+            return true;
+        }
+
+        return IsPlatformSpecificPropertyName(name);
     }
 
     private static Type InferMsBuildPropertyType(string? value)
@@ -2948,10 +4208,28 @@ internal static class Program
     {
         globalProperties.TryGetValue("Configuration", out var configuration);
         globalProperties.TryGetValue("Platform", out var platform);
+        globalProperties.TryGetValue("TargetFramework", out var targetFramework);
+
+        if (!string.IsNullOrWhiteSpace(configuration) &&
+            !string.IsNullOrWhiteSpace(platform) &&
+            !string.IsNullOrWhiteSpace(targetFramework))
+        {
+            return $"'$(Configuration)|$(Platform)|$(TargetFramework)'=='{configuration}|{platform}|{targetFramework}'";
+        }
 
         if (!string.IsNullOrWhiteSpace(configuration) && !string.IsNullOrWhiteSpace(platform))
         {
             return $"'$(Configuration)|$(Platform)'=='{configuration}|{platform}'";
+        }
+
+        if (!string.IsNullOrWhiteSpace(configuration) && !string.IsNullOrWhiteSpace(targetFramework))
+        {
+            return $"'$(Configuration)|$(TargetFramework)'=='{configuration}|{targetFramework}'";
+        }
+
+        if (!string.IsNullOrWhiteSpace(platform) && !string.IsNullOrWhiteSpace(targetFramework))
+        {
+            return $"'$(Platform)|$(TargetFramework)'=='{platform}|{targetFramework}'";
         }
 
         if (!string.IsNullOrWhiteSpace(configuration))
@@ -2962,6 +4240,11 @@ internal static class Program
         if (!string.IsNullOrWhiteSpace(platform))
         {
             return $"'$(Platform)'=='{platform}'";
+        }
+
+        if (!string.IsNullOrWhiteSpace(targetFramework))
+        {
+            return $"'$(TargetFramework)'=='{targetFramework}'";
         }
 
         return null;
@@ -3026,40 +4309,16 @@ internal static class Program
 
     private static List<PropertyPage> DeduplicatePropertyPages(List<PropertyPage> pages)
     {
-        var bestEntries = new Dictionary<string, PropertyEntry>(StringComparer.OrdinalIgnoreCase);
-
+        var merged = new List<PropertyPage>();
         foreach (var page in pages)
         {
             foreach (var entry in page.Items)
             {
-                var key = NormalizePropertyKey(entry.Key);
-                if (bestEntries.TryGetValue(key, out var existing))
-                {
-                    if (entry.Source < existing.Source)
-                    {
-                        bestEntries[key] = entry;
-                    }
-
-                    continue;
-                }
-
-                bestEntries[key] = entry;
+                AddPropertyEntry(merged, page.Name, entry);
             }
         }
 
-        var rebuilt = new List<PropertyPage>();
-        foreach (var known in KnownPropertyPages)
-        {
-            rebuilt.Add(new PropertyPage(known, new List<PropertyEntry>()));
-        }
-
-        foreach (var entry in bestEntries.Values)
-        {
-            var pageName = MapPropertyPageName(entry.Category, entry.Name);
-            AddPropertyEntry(rebuilt, pageName, entry);
-        }
-
-        return rebuilt;
+        return merged;
     }
 
     private static void OverlayUiaValues(List<PropertyPage> pages, UiaPropertySession uiaSession)
@@ -3146,6 +4405,11 @@ internal static class Program
             return "Application/General";
         }
 
+        if (string.Equals(pageName, "Application/Resources", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Application/Win32 Resources";
+        }
+
         foreach (var known in KnownPropertyPages)
         {
             if (string.Equals(known, pageName, StringComparison.OrdinalIgnoreCase))
@@ -3157,8 +4421,136 @@ internal static class Program
         return pageName;
     }
 
+    private static bool IsPlatformSpecificPropertyName(string name)
+    {
+        return IsIosPropertyName(name)
+            || IsAndroidPropertyName(name)
+            || IsWindowsPropertyName(name)
+            || IsTizenPropertyName(name);
+    }
+
+    private static bool IsIosPropertyName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        return name.Contains("Mtouch", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("Codesign", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("Provision", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("Entitlement", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("Ipa", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("iOS", StringComparison.OrdinalIgnoreCase)
+               || name.StartsWith("Ios", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("Xcode", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsAndroidPropertyName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        return name.Contains("Android", StringComparison.OrdinalIgnoreCase)
+               || name.StartsWith("Aapt", StringComparison.OrdinalIgnoreCase)
+               || name.StartsWith("Dex", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("D8", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("R8", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("Proguard", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsWindowsPropertyName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        return name.Contains("Windows", StringComparison.OrdinalIgnoreCase)
+               || name.Contains("Uap", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsTizenPropertyName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return false;
+        }
+
+        return name.Contains("Tizen", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string MapIosPropertyPageName(string propertyName)
+    {
+        bool Contains(string value) => propertyName.Contains(value, StringComparison.OrdinalIgnoreCase);
+
+        if (Contains("Codesign") || Contains("Provision") || Contains("Entitlement") || Contains("Signing") || Contains("Team"))
+        {
+            return "ios/Bundle Signing";
+        }
+
+        if (Contains("Ipa") || Contains("Archive"))
+        {
+            return "ios/IPA Options";
+        }
+
+        if (Contains("Manifest") || Contains("InfoPlist") || Contains("Info.plist"))
+        {
+            return "ios/Manifest";
+        }
+
+        if (Contains("OnDemand"))
+        {
+            return "ios/On Demand Resources";
+        }
+
+        if (Contains("Debug"))
+        {
+            return "ios/debug";
+        }
+
+        if (Contains("Run") || Contains("Launch"))
+        {
+            return "ios/Run Options";
+        }
+
+        return "ios/Build";
+    }
+
+    private static string MapAndroidPropertyPageName(string propertyName)
+    {
+        return "Application/Android Targets";
+    }
+
     private static string MapPropertyPageName(string category, string propertyName)
     {
+        if (!string.IsNullOrWhiteSpace(category) && category.Contains("/", StringComparison.Ordinal))
+        {
+            return NormalizePageName(category);
+        }
+
+        if (IsIosPropertyName(propertyName))
+        {
+            return NormalizePageName(MapIosPropertyPageName(propertyName));
+        }
+
+        if (IsAndroidPropertyName(propertyName))
+        {
+            return NormalizePageName(MapAndroidPropertyPageName(propertyName));
+        }
+
+        if (IsWindowsPropertyName(propertyName))
+        {
+            return "Application/Windows Targets";
+        }
+
+        if (IsTizenPropertyName(propertyName))
+        {
+            return "Application/Tizen Targets";
+        }
+
         if (!string.IsNullOrWhiteSpace(category))
         {
             var normalizedCategory = category.Trim();
@@ -3663,7 +5055,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            Console.Error.WriteLine($"Unexpected error: {FormatUnexpectedError(ex)}");
             return 1;
         }
         finally
@@ -3766,7 +5158,7 @@ internal static class Program
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"Unexpected error: {ex.Message}");
+            Console.Error.WriteLine($"Unexpected error: {FormatUnexpectedError(ex)}");
             return 1;
         }
         finally
@@ -4762,6 +6154,79 @@ internal static class Program
 
         public Version Version { get; }
         public string Path { get; }
+    }
+
+    private sealed class RuleDefinition
+    {
+        public RuleDefinition(string name, string displayName)
+        {
+            Name = name;
+            DisplayName = displayName;
+            Categories = new Dictionary<string, RuleCategoryDefinition>(StringComparer.OrdinalIgnoreCase);
+            Properties = new List<RulePropertyDefinition>();
+        }
+
+        public string Name { get; }
+        public string DisplayName { get; }
+        public string? Description { get; set; }
+        public string? AppliesTo { get; set; }
+        public string? PageTemplate { get; set; }
+        public string? DataSourcePersistence { get; set; }
+        public string? DataSourceItemType { get; set; }
+        public Dictionary<string, RuleCategoryDefinition> Categories { get; }
+        public List<RulePropertyDefinition> Properties { get; }
+    }
+
+    private sealed class RuleCategoryDefinition
+    {
+        public RuleCategoryDefinition(string name, string displayName)
+        {
+            Name = name;
+            DisplayName = displayName;
+        }
+
+        public string Name { get; }
+        public string DisplayName { get; }
+        public string? Description { get; set; }
+    }
+
+    private sealed class RulePropertyDefinition
+    {
+        public RulePropertyDefinition(string name, string displayName)
+        {
+            Name = name;
+            DisplayName = displayName;
+            EnumValues = new List<string>();
+            EnumValueMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        public string Name { get; }
+        public string DisplayName { get; }
+        public string? Description { get; set; }
+        public string? Category { get; set; }
+        public string? CategoryDisplayName { get; set; }
+        public string? PropertyKind { get; set; }
+        public bool Visible { get; set; } = true;
+        public string? DataSourcePersistence { get; set; }
+        public string? DataSourceItemType { get; set; }
+        public string? PersistedName { get; set; }
+        public List<string> EnumValues { get; }
+        public Dictionary<string, string> EnumValueMap { get; }
+    }
+
+    private sealed class PlatformPropertyDefinition
+    {
+        public PlatformPropertyDefinition(string name, string pageName, Type propertyType)
+        {
+            Name = name;
+            PageName = pageName;
+            PropertyType = propertyType;
+        }
+
+        public string Name { get; }
+        public string PageName { get; }
+        public Type PropertyType { get; }
+        public string? Description { get; set; }
     }
 
     private sealed class MsBuildEvaluation : IDisposable
@@ -5811,6 +7276,9 @@ internal static class Program
         public object? FallbackValue { get; set; }
         public object? UiaValue { get; set; }
         public Func<(bool Success, string? Message)>? DeleteAction { get; set; }
+        public IReadOnlyList<string>? AllowedValues { get; set; }
+        public Dictionary<string, string>? AllowedValueMap { get; set; }
+        public string? Description { get; set; }
     }
 
     private sealed class ProjectEntry
