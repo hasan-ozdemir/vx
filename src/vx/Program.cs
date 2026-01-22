@@ -5,6 +5,7 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.Loader;
 using System.Runtime.InteropServices;
 using System.Runtime.InteropServices.ComTypes;
 using System.Text.Json;
@@ -24,6 +25,8 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        RegisterAssemblyResolvers();
+
         if (args.Length == 0 || IsHelp(args[0]))
         {
             PrintHelp();
@@ -719,16 +722,14 @@ internal static class Program
                 return 1;
             }
 
-            if (IsUiaEnabledForList())
+            var printablePages = pages.Where(p => p.Items.Count > 0).ToList();
+            if (printablePages.Count == 0)
             {
-                using var uiaSession = UiaPropertySession.TryCreate(dte, project);
-                if (uiaSession != null)
-                {
-                    OverlayUiaValues(pages, uiaSession);
-                }
+                Console.Error.WriteLine("No project properties found. Ensure MSBuild evaluation is available.");
+                return 1;
             }
 
-            foreach (var page in pages.Where(p => p.Items.Count > 0))
+            foreach (var page in printablePages)
             {
                 Console.WriteLine($"*[{page.Name}]:");
                 foreach (var item in page.Items)
@@ -796,20 +797,7 @@ internal static class Program
             }
 
             var includeMsBuild = PrepareMsBuild();
-            UiaPropertySession? uiaSession = null;
-            if (!IsUiaDisabled())
-            {
-                uiaSession = UiaPropertySession.TryCreate(dte, project);
-            }
-
-            try
-            {
-                return RunPropertyWizardForProject(project, includeMsBuild, uiaSession);
-            }
-            finally
-            {
-                uiaSession?.Dispose();
-            }
+            return RunPropertyWizardForProject(project, includeMsBuild, null);
         }
         catch (COMException ex)
         {
@@ -1230,7 +1218,14 @@ internal static class Program
     private static bool MsBuildRegistrationAttempted;
     private static bool MsBuildRegistrationSucceeded;
     private static bool MsBuildRegistrationLogged;
+    private static bool MsBuildEvaluationLogged;
     private static bool UiaUnavailableLogged;
+    private static bool AssemblyResolversRegistered;
+    private static bool DotnetSdkEnvironmentResolved;
+    private static string? CachedDotnetSdksPath;
+    private static string? CachedDotnetSdkVersion;
+    private static string? CachedDotnetSdkRootPath;
+    private static bool NuGetAssembliesEnsured;
 
     private static readonly string[] KnownPropertyPages =
     {
@@ -1273,6 +1268,98 @@ internal static class Program
         "ios/Run Options"
     };
 
+    private static readonly HashSet<string> KnownPropertyNames = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "AssemblyName",
+        "RootNamespace",
+        "OutputType",
+        "TargetFramework",
+        "TargetFrameworks",
+        "TargetFrameworkIdentifier",
+        "TargetFrameworkVersion",
+        "TargetFrameworkMoniker",
+        "TargetPlatformIdentifier",
+        "TargetPlatformVersion",
+        "SupportedOSPlatformVersion",
+        "ApplicationIcon",
+        "ApplicationManifest",
+        "StartupObject",
+        "AssemblyVersion",
+        "FileVersion",
+        "Version",
+        "VersionPrefix",
+        "VersionSuffix",
+        "Company",
+        "Product",
+        "Description",
+        "Copyright",
+        "NeutralLanguage",
+        "GenerateAssemblyInfo",
+        "GenerateDocumentationFile",
+        "DocumentationFile",
+        "DefineConstants",
+        "Optimize",
+        "DebugType",
+        "DebugSymbols",
+        "WarningLevel",
+        "TreatWarningsAsErrors",
+        "TreatSpecificWarningsAsErrors",
+        "NoWarn",
+        "Nullable",
+        "LangVersion",
+        "PlatformTarget",
+        "Prefer32Bit",
+        "AllowUnsafeBlocks",
+        "Deterministic",
+        "CheckForOverflowUnderflow",
+        "IntermediateOutputPath",
+        "OutputPath",
+        "BaseIntermediateOutputPath",
+        "BaseOutputPath",
+        "RunAnalyzersDuringBuild",
+        "RunAnalyzersDuringLiveAnalysis",
+        "AnalysisLevel",
+        "AnalysisMode",
+        "EnableNETAnalyzers",
+        "ImplicitUsings",
+        "PackageId",
+        "PackageVersion",
+        "PackageDescription",
+        "PackageTags",
+        "PackageProjectUrl",
+        "PackageReleaseNotes",
+        "PackageIcon",
+        "PackageLicenseExpression",
+        "PackageLicenseFile",
+        "PackageRequireLicenseAcceptance",
+        "GeneratePackageOnBuild",
+        "PackageOutputPath",
+        "PackageReadmeFile",
+        "RepositoryUrl",
+        "RepositoryType",
+        "IncludeSymbols",
+        "SymbolPackageFormat",
+        "SignAssembly",
+        "DelaySign",
+        "AssemblyOriginatorKeyFile",
+        "UseMaui",
+        "ApplicationTitle",
+        "ApplicationId",
+        "ApplicationVersion",
+        "ApplicationDisplayVersion",
+        "RuntimeIdentifier",
+        "RuntimeIdentifiers",
+        "CodesignKey",
+        "CodesignProvision",
+        "CodesignEntitlements",
+        "DevelopmentTeamId",
+        "AndroidKeyStore",
+        "AndroidSigningKeyStore",
+        "AndroidSigningKeyAlias",
+        "AndroidSigningKeyPass",
+        "AndroidSigningStorePass"
+    };
+
     private static List<PropertyPage> GetProjectPropertyPages(object? project, bool includeMsBuild)
     {
         var pages = new List<PropertyPage>();
@@ -1284,29 +1371,25 @@ internal static class Program
         dynamic? dynamicProject = project;
         MsBuildEvaluation? msbuildEvaluation = null;
         Dictionary<string, MsBuildPropertyValue>? msbuildMap = null;
+        var projectPath = GetProjectPath(dynamicProject);
+        var allowedNames = includeMsBuild && !ShouldIncludeAllMsBuildProperties()
+            ? BuildAllowedMsBuildPropertyNames(projectPath)
+            : null;
         if (includeMsBuild)
         {
             msbuildEvaluation = TryCreateMsBuildEvaluation(dynamicProject);
             if (msbuildEvaluation != null)
             {
-                msbuildMap = BuildMsBuildPropertyMap(msbuildEvaluation.Project);
+                msbuildMap = BuildMsBuildPropertyMap(msbuildEvaluation.Project, allowedNames);
                 AddPropertyPagesFromMsBuild(pages, dynamicProject, msbuildMap);
+            }
+            else if (!string.IsNullOrWhiteSpace(projectPath) && File.Exists(projectPath))
+            {
+                AddPropertyPagesFromProjectFilesFallback(pages, projectPath);
             }
         }
 
-        var projectObject = TryGetValue(() => (object?)dynamicProject?.Object) ?? project;
-        AddPropertyPagesFromObject(pages, projectObject, msbuildMap, msbuildEvaluation);
-
-        var configManager = TryGetValue(() => (dynamic)dynamicProject?.ConfigurationManager);
-        var activeConfig = TryGetValue(() => (dynamic)configManager?.ActiveConfiguration);
-        var configObject = TryGetValue(() => (object?)activeConfig?.Object) ?? (object?)activeConfig;
-        AddPropertyPagesFromObject(pages, configObject, msbuildMap, msbuildEvaluation);
-
-        var projectProps = TryGetValue(() => (dynamic)dynamicProject?.Properties);
-        AddPropertyPageFromComProperties(pages, projectProps, msbuildMap, msbuildEvaluation);
-
-        var configProps = TryGetValue(() => (dynamic)activeConfig?.Properties);
-        AddPropertyPageFromComProperties(pages, configProps, msbuildMap, msbuildEvaluation);
+        AddPropertyPagesFromUserFile(pages, projectPath);
 
         pages = DeduplicatePropertyPages(pages);
 
@@ -1326,6 +1409,48 @@ internal static class Program
 
         msbuildEvaluation?.Dispose();
         return ordered;
+    }
+
+    private static bool ShouldIncludeAllMsBuildProperties()
+    {
+        var value = Environment.GetEnvironmentVariable("VX_PROPS_ALL");
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static HashSet<string>? BuildAllowedMsBuildPropertyNames(string? projectPath)
+    {
+        var allowed = new HashSet<string>(KnownPropertyNames, StringComparer.OrdinalIgnoreCase);
+
+        if (string.IsNullOrWhiteSpace(projectPath) || !File.Exists(projectPath))
+        {
+            return allowed;
+        }
+
+        foreach (var pair in CollectPropertyValuesFromProjectFiles(projectPath))
+        {
+            if (!string.IsNullOrWhiteSpace(pair.Key))
+            {
+                allowed.Add(pair.Key);
+            }
+        }
+
+        var userFile = projectPath + ".user";
+        foreach (var pair in ReadPropertyValuesFromMsBuildFile(userFile))
+        {
+            if (!string.IsNullOrWhiteSpace(pair.Key))
+            {
+                allowed.Add(pair.Key);
+            }
+        }
+
+        return allowed;
     }
 
     private static void AddPropertyPagesFromObject(List<PropertyPage> pages, object? target, Dictionary<string, MsBuildPropertyValue>? msbuildMap, MsBuildEvaluation? msbuildEvaluation)
@@ -1427,8 +1552,7 @@ internal static class Program
 
     private static void AddPropertyPagesFromMsBuild(List<PropertyPage> pages, dynamic project, Dictionary<string, MsBuildPropertyValue> msbuildMap)
     {
-        var projectPath = TryGetValue(() => (string?)project.FullName)
-            ?? TryGetValue(() => (string?)project.FileName);
+        var projectPath = GetProjectPath(project);
 
         if (string.IsNullOrWhiteSpace(projectPath) || !File.Exists(projectPath))
         {
@@ -1474,6 +1598,332 @@ internal static class Program
         }
     }
 
+    private static void AddPropertyPagesFromUserFile(List<PropertyPage> pages, string? projectPath)
+    {
+        if (string.IsNullOrWhiteSpace(projectPath))
+        {
+            return;
+        }
+
+        var userFilePath = projectPath + ".user";
+        if (!File.Exists(userFilePath))
+        {
+            return;
+        }
+
+        Dictionary<string, string> properties;
+        try
+        {
+            properties = ReadPropertyValuesFromMsBuildFile(userFilePath);
+        }
+        catch
+        {
+            return;
+        }
+
+        foreach (var entryPair in properties)
+        {
+            var name = entryPair.Key;
+            var value = entryPair.Value;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            var pageName = MapPropertyPageName(string.Empty, name);
+            var category = pageName;
+            object? cachedValue = value;
+            var inferredType = InferMsBuildPropertyType(value);
+
+            Action<object?> setter = newValue =>
+            {
+                SetPropertyInMsBuildFile(userFilePath, name, newValue);
+                cachedValue = newValue;
+            };
+
+            Func<object?> getter = () => cachedValue;
+            var entry = new PropertyEntry(name, name, category, getter, setter, inferredType, PropertySource.UserFile);
+            entry.DeleteAction = () =>
+            {
+                string? deleteMessage;
+                var success = RemovePropertyFromMsBuildFile(userFilePath, name, out deleteMessage);
+                if (success)
+                {
+                    cachedValue = null;
+                }
+
+                return (success, deleteMessage);
+            };
+            AddPropertyEntry(pages, pageName, entry);
+        }
+    }
+
+    private static void AddPropertyPagesFromProjectFilesFallback(List<PropertyPage> pages, string projectPath)
+    {
+        Dictionary<string, (string Value, string FilePath)> properties;
+        try
+        {
+            properties = CollectPropertyValuesFromProjectFiles(projectPath);
+        }
+        catch
+        {
+            return;
+        }
+
+        foreach (var entryPair in properties)
+        {
+            var name = entryPair.Key;
+            var value = entryPair.Value.Value;
+            var sourceFile = entryPair.Value.FilePath;
+            if (string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            var pageName = MapPropertyPageName(string.Empty, name);
+            var category = pageName;
+            object? cachedValue = value;
+            var inferredType = InferMsBuildPropertyType(value);
+
+            Action<object?> setter = newValue =>
+            {
+                SetPropertyInMsBuildFile(sourceFile, name, newValue);
+                cachedValue = newValue;
+            };
+
+            Func<object?> getter = () => cachedValue;
+            var entry = new PropertyEntry(name, name, category, getter, setter, inferredType, PropertySource.MsBuild);
+            entry.DeleteAction = () =>
+            {
+                string? deleteMessage;
+                var success = RemovePropertyFromMsBuildFile(sourceFile, name, out deleteMessage);
+                if (success)
+                {
+                    cachedValue = null;
+                }
+
+                return (success, deleteMessage);
+            };
+            AddPropertyEntry(pages, pageName, entry);
+        }
+    }
+
+    private static Dictionary<string, (string Value, string FilePath)> CollectPropertyValuesFromProjectFiles(string projectPath)
+    {
+        var map = new Dictionary<string, (string Value, string FilePath)>(StringComparer.OrdinalIgnoreCase);
+        var projectDir = Path.GetDirectoryName(projectPath);
+
+        if (!string.IsNullOrWhiteSpace(projectDir))
+        {
+            foreach (var file in EnumerateDirectoryBuildFiles(projectDir, "Directory.Build.props", topDown: true))
+            {
+                MergePropertyFile(map, file);
+            }
+
+            foreach (var file in EnumerateDirectoryBuildFiles(projectDir, "Directory.Packages.props", topDown: true))
+            {
+                MergePropertyFile(map, file);
+            }
+        }
+
+        MergePropertyFile(map, projectPath);
+
+        if (!string.IsNullOrWhiteSpace(projectDir))
+        {
+            foreach (var file in EnumerateDirectoryBuildFiles(projectDir, "Directory.Build.targets", topDown: false))
+            {
+                MergePropertyFile(map, file);
+            }
+        }
+
+        return map;
+    }
+
+    private static void MergePropertyFile(Dictionary<string, (string Value, string FilePath)> map, string filePath)
+    {
+        var properties = ReadPropertyValuesFromMsBuildFile(filePath);
+        foreach (var entry in properties)
+        {
+            map[entry.Key] = (entry.Value, filePath);
+        }
+    }
+
+    private static IEnumerable<string> EnumerateDirectoryBuildFiles(string startDir, string fileName, bool topDown)
+    {
+        var directories = new List<string>();
+        var current = new DirectoryInfo(startDir);
+        while (current != null)
+        {
+            directories.Add(current.FullName);
+            current = current.Parent;
+        }
+
+        if (topDown)
+        {
+            directories.Reverse();
+        }
+
+        foreach (var dir in directories)
+        {
+            var path = Path.Combine(dir, fileName);
+            if (File.Exists(path))
+            {
+                yield return path;
+            }
+        }
+    }
+
+    private static string? GetProjectPath(dynamic project)
+    {
+        var path = TryGetValue(() => (string?)project?.FullName)
+            ?? TryGetValue(() => (string?)project?.FileName);
+
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            path = TryGetProjectPropertyValue(project, "FullPath")
+                ?? TryGetProjectPropertyValue(project, "FullProjectFileName")
+                ?? TryGetProjectPropertyValue(project, "ProjectFile");
+        }
+
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        if (!Path.IsPathRooted(path))
+        {
+            var solutionPath = TryGetValue(() => (string?)project?.DTE?.Solution?.FullName);
+            var solutionDir = string.IsNullOrWhiteSpace(solutionPath)
+                ? null
+                : Path.GetDirectoryName(solutionPath);
+            if (!string.IsNullOrWhiteSpace(solutionDir))
+            {
+                path = Path.Combine(solutionDir, path);
+            }
+        }
+
+        if (Directory.Exists(path))
+        {
+            var projectName = TryGetValue(() => (string?)project?.Name) ?? string.Empty;
+            var candidate = Directory.EnumerateFiles(path, $"{projectName}.*proj", SearchOption.TopDirectoryOnly)
+                .FirstOrDefault()
+                ?? Directory.EnumerateFiles(path, "*.*proj", SearchOption.TopDirectoryOnly).FirstOrDefault();
+            if (!string.IsNullOrWhiteSpace(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        return path;
+    }
+
+    private static string? TryGetProjectPropertyValue(dynamic project, string propertyName)
+    {
+        var props = TryGetValue(() => (dynamic)project?.Properties);
+        if (props == null)
+        {
+            return null;
+        }
+
+        var prop = TryGetValue(() => (dynamic)props.Item(propertyName));
+        if (prop == null)
+        {
+            return null;
+        }
+
+        return TryGetValue(() => (string?)prop.Value);
+    }
+
+    private static Dictionary<string, string> ReadPropertyValuesFromMsBuildFile(string filePath)
+    {
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var root = ProjectRootElement.Open(filePath);
+        foreach (var group in root.PropertyGroups)
+        {
+            foreach (var prop in group.Properties)
+            {
+                if (string.IsNullOrWhiteSpace(prop.Name))
+                {
+                    continue;
+                }
+
+                map[prop.Name] = prop.Value ?? string.Empty;
+            }
+        }
+
+        return map;
+    }
+
+    private static void SetPropertyInMsBuildFile(string filePath, string propertyName, object? value)
+    {
+        var textValue = value?.ToString() ?? string.Empty;
+        var root = LoadOrCreateMsBuildFile(filePath);
+        var group = FindOrCreatePropertyGroup(root);
+
+        var property = group.Properties
+            .FirstOrDefault(p => string.Equals(p.Name, propertyName, StringComparison.OrdinalIgnoreCase));
+        if (property == null)
+        {
+            group.AddProperty(propertyName, textValue);
+        }
+        else
+        {
+            property.Value = textValue;
+        }
+
+        root.Save();
+    }
+
+    private static bool RemovePropertyFromMsBuildFile(string filePath, string propertyName, out string? message)
+    {
+        message = null;
+        if (!File.Exists(filePath))
+        {
+            message = "Property file not found.";
+            return false;
+        }
+
+        var root = ProjectRootElement.Open(filePath);
+        foreach (var group in root.PropertyGroups)
+        {
+            var match = group.Properties
+                .FirstOrDefault(p => string.Equals(p.Name, propertyName, StringComparison.OrdinalIgnoreCase));
+            if (match != null)
+            {
+                group.RemoveChild(match);
+                root.Save();
+                return true;
+            }
+        }
+
+        message = "Property not found in file.";
+        return false;
+    }
+
+    private static ProjectRootElement LoadOrCreateMsBuildFile(string filePath)
+    {
+        if (File.Exists(filePath))
+        {
+            return ProjectRootElement.Open(filePath);
+        }
+
+        var directory = Path.GetDirectoryName(filePath);
+        if (!string.IsNullOrWhiteSpace(directory))
+        {
+            Directory.CreateDirectory(directory);
+        }
+
+        var root = ProjectRootElement.Create(filePath);
+        root.Save();
+        return root;
+    }
+
+    private static ProjectPropertyGroupElement FindOrCreatePropertyGroup(ProjectRootElement root)
+    {
+        var group = root.PropertyGroups.FirstOrDefault(pg => string.IsNullOrWhiteSpace(pg.Condition));
+        return group ?? root.AddPropertyGroup();
+    }
+
     private static MsBuildEvaluation? TryCreateMsBuildEvaluation(dynamic project)
     {
         var projectPath = TryGetValue(() => (string?)project.FullName)
@@ -1495,13 +1945,14 @@ internal static class Program
             var msbuildProject = new Project(projectPath, globalProperties, null, collection, loadSettings);
             return new MsBuildEvaluation(collection, msbuildProject);
         }
-        catch
+        catch (Exception ex)
         {
+            LogMsBuildEvaluationFailure(ex.Message);
             return null;
         }
     }
 
-    private static Dictionary<string, MsBuildPropertyValue> BuildMsBuildPropertyMap(Project msbuildProject)
+    private static Dictionary<string, MsBuildPropertyValue> BuildMsBuildPropertyMap(Project msbuildProject, HashSet<string>? allowedNames)
     {
         var map = new Dictionary<string, MsBuildPropertyValue>(StringComparer.OrdinalIgnoreCase);
 
@@ -1509,6 +1960,21 @@ internal static class Program
         {
             var name = prop.Name;
             if (string.IsNullOrWhiteSpace(name))
+            {
+                continue;
+            }
+
+            if (prop.IsEnvironmentProperty || prop.IsReservedProperty)
+            {
+                continue;
+            }
+
+            if (!ShouldIncludeMsBuildProperty(name))
+            {
+                continue;
+            }
+
+            if (allowedNames != null && !allowedNames.Contains(name))
             {
                 continue;
             }
@@ -1535,19 +2001,33 @@ internal static class Program
         MsBuildRegistrationAttempted = true;
         try
         {
+            if (IsPackagedMsBuildAssembly())
+            {
+                MsBuildRegistrationSucceeded = true;
+                return true;
+            }
+
             if (!MSBuildLocator.IsRegistered)
             {
-                var instances = MSBuildLocator.QueryVisualStudioInstances().ToList();
-                if (instances.Count > 0)
+                if (!TryRegisterMsBuildViaDotnetSdk(out var dotnetError))
                 {
-                    var instance = instances
-                        .OrderByDescending(item => item.Version)
-                        .First();
-                    MSBuildLocator.RegisterInstance(instance);
-                }
-                else
-                {
-                    MSBuildLocator.RegisterDefaults();
+                    var allowDotNetInstances = string.IsNullOrWhiteSpace(dotnetError)
+                        || !dotnetError.Contains("No compatible dotnet SDK", StringComparison.OrdinalIgnoreCase);
+
+                    if (!TryRegisterMsBuildViaVisualStudioInstances(allowDotNetInstances, out var instanceError))
+                    {
+                        if (!string.IsNullOrWhiteSpace(dotnetError))
+                        {
+                            throw new InvalidOperationException(dotnetError);
+                        }
+
+                        if (!string.IsNullOrWhiteSpace(instanceError))
+                        {
+                            throw new InvalidOperationException(instanceError);
+                        }
+
+                        throw new InvalidOperationException("No MSBuild instances found.");
+                    }
                 }
             }
 
@@ -1571,6 +2051,408 @@ internal static class Program
         }
     }
 
+    private static bool IsPackagedMsBuildAssembly()
+    {
+        try
+        {
+            var location = typeof(ProjectCollection).Assembly.Location;
+            if (string.IsNullOrWhiteSpace(location))
+            {
+                return false;
+            }
+
+            return location.StartsWith(AppContext.BaseDirectory, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void RegisterAssemblyResolvers()
+    {
+        if (AssemblyResolversRegistered)
+        {
+            return;
+        }
+
+        AssemblyResolversRegistered = true;
+        AssemblyLoadContext.Default.Resolving += (_, name) =>
+        {
+            if (!string.Equals(name.Name, "System.Collections.Immutable", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.IsNullOrWhiteSpace(name.Name) &&
+                    name.Name.StartsWith("NuGet.", StringComparison.OrdinalIgnoreCase))
+                {
+                    var sdkRoot = CachedDotnetSdkRootPath;
+                    if (string.IsNullOrWhiteSpace(sdkRoot))
+                    {
+                        if (TryResolveDotnetSdkSdksPath(null, out var sdksPath, out var sdkVersion))
+                        {
+                            CachedDotnetSdksPath = sdksPath;
+                            CachedDotnetSdkVersion = sdkVersion;
+                            CachedDotnetSdkRootPath = Path.GetDirectoryName(sdksPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+                        }
+
+                        sdkRoot = CachedDotnetSdkRootPath;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(sdkRoot))
+                    {
+                        var nugetCandidate = Path.Combine(sdkRoot, $"{name.Name}.dll");
+                        if (File.Exists(nugetCandidate))
+                        {
+                            try
+                            {
+                                return AssemblyLoadContext.Default.LoadFromAssemblyPath(nugetCandidate);
+                            }
+                            catch
+                            {
+                                return null;
+                            }
+                        }
+                    }
+                }
+
+                return null;
+            }
+
+            var candidate = Path.Combine(AppContext.BaseDirectory, "System.Collections.Immutable.dll");
+            if (!File.Exists(candidate))
+            {
+                return null;
+            }
+
+            try
+            {
+                return AssemblyLoadContext.Default.LoadFromAssemblyPath(candidate);
+            }
+            catch
+            {
+                return null;
+            }
+        };
+    }
+
+    private static bool TryRegisterMsBuildViaDotnetSdk(out string? error)
+    {
+        error = null;
+        if (MSBuildLocator.IsRegistered)
+        {
+            return true;
+        }
+
+        if (!TryFindDotnetSdkPath(out var sdkPath, out error))
+        {
+            return false;
+        }
+
+        try
+        {
+            MSBuildLocator.RegisterMSBuildPath(sdkPath);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private static bool TryRegisterMsBuildViaVisualStudioInstances(bool allowDotNetSdkInstances, out string? error)
+    {
+        error = null;
+        if (MSBuildLocator.IsRegistered)
+        {
+            return true;
+        }
+
+        var instances = MSBuildLocator.QueryVisualStudioInstances().ToList();
+        if (!allowDotNetSdkInstances)
+        {
+            instances = instances
+                .Where(item => item.DiscoveryType != DiscoveryType.DotNetSdk)
+                .ToList();
+        }
+
+        if (instances.Count == 0)
+        {
+            error = "No Visual Studio MSBuild instances found.";
+            return false;
+        }
+
+        var ordered = instances
+            .OrderBy(item => IsPrereleaseInstance(item))
+            .ThenByDescending(item => item.DiscoveryType == DiscoveryType.VisualStudioSetup)
+            .ThenByDescending(item => item.Version)
+            .ToList();
+
+        try
+        {
+            MSBuildLocator.RegisterInstance(ordered[0]);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private static bool IsPrereleaseInstance(VisualStudioInstance instance)
+    {
+        return IsPrereleasePath(instance.MSBuildPath) || IsPrereleasePath(instance.Name);
+    }
+
+    private static bool IsPrereleasePath(string? value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return value.Contains("Insiders", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("Preview", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool TryFindDotnetSdkPath(out string? sdkPath, out string? error)
+    {
+        sdkPath = null;
+        error = null;
+
+        if (!TryGetDotnetSdks(out var sdks, out error))
+        {
+            return false;
+        }
+
+        var runtimeMajor = Environment.Version.Major;
+        var candidate = sdks
+            .Where(sdk => sdk.Version.Major <= runtimeMajor && File.Exists(Path.Combine(sdk.Path, "MSBuild.dll")))
+            .OrderByDescending(sdk => sdk.Version)
+            .FirstOrDefault();
+
+        if (candidate == null)
+        {
+            error = $"No compatible dotnet SDK with MSBuild.dll found (<= {runtimeMajor}).";
+            return false;
+        }
+
+        sdkPath = candidate.Path;
+        return true;
+    }
+
+    private static bool TryGetDotnetSdks(out List<DotnetSdkInfo> sdks, out string? error)
+    {
+        sdks = new List<DotnetSdkInfo>();
+        error = null;
+
+        if (!TryRunProcess("dotnet", "--list-sdks", out var stdout, out var stderr))
+        {
+            error = string.IsNullOrWhiteSpace(stderr) ? "Failed to query dotnet SDKs." : stderr;
+            return false;
+        }
+
+        foreach (var line in stdout.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries))
+        {
+            var trimmed = line.Trim();
+            var bracketIndex = trimmed.IndexOf('[');
+            if (bracketIndex <= 0)
+            {
+                continue;
+            }
+
+            var versionText = trimmed.Substring(0, bracketIndex).Trim();
+            var endBracket = trimmed.IndexOf(']', bracketIndex + 1);
+            if (endBracket <= bracketIndex)
+            {
+                continue;
+            }
+
+            var basePath = trimmed.Substring(bracketIndex + 1, endBracket - bracketIndex - 1).Trim();
+            if (!Version.TryParse(versionText, out var version))
+            {
+                continue;
+            }
+
+            var candidate = Path.Combine(basePath, versionText);
+            if (!Directory.Exists(candidate))
+            {
+                continue;
+            }
+
+            sdks.Add(new DotnetSdkInfo(version, candidate));
+        }
+
+        if (sdks.Count == 0)
+        {
+            error = "No dotnet SDKs found.";
+            return false;
+        }
+
+        return true;
+    }
+
+    private static void EnsureDotnetSdkEnvironment(string? projectPath, string? solutionDir)
+    {
+        if (DotnetSdkEnvironmentResolved)
+        {
+            return;
+        }
+
+        DotnetSdkEnvironmentResolved = true;
+
+        var globalJsonPath = FindGlobalJsonPath(projectPath, solutionDir);
+        if (!TryResolveDotnetSdkSdksPath(globalJsonPath, out var sdksPath, out var sdkVersion))
+        {
+            return;
+        }
+
+        CachedDotnetSdksPath = sdksPath;
+        CachedDotnetSdkVersion = sdkVersion;
+        CachedDotnetSdkRootPath = Path.GetDirectoryName(sdksPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+
+        Environment.SetEnvironmentVariable("MSBuildSDKsPath", sdksPath);
+        Environment.SetEnvironmentVariable("DOTNET_MSBUILD_SDK_RESOLVER_SDKS_DIR", sdksPath);
+        if (!string.IsNullOrWhiteSpace(sdkVersion))
+        {
+            Environment.SetEnvironmentVariable("DOTNET_MSBUILD_SDK_RESOLVER_SDKS_VER", sdkVersion);
+        }
+    }
+
+    private static void EnsureNuGetAssembliesPresent()
+    {
+        if (NuGetAssembliesEnsured)
+        {
+            return;
+        }
+
+        NuGetAssembliesEnsured = true;
+        var sdkRoot = CachedDotnetSdkRootPath;
+        if (string.IsNullOrWhiteSpace(sdkRoot))
+        {
+            if (TryResolveDotnetSdkSdksPath(null, out var sdksPath, out var sdkVersion))
+            {
+                CachedDotnetSdksPath = sdksPath;
+                CachedDotnetSdkVersion = sdkVersion;
+                CachedDotnetSdkRootPath = Path.GetDirectoryName(sdksPath.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            }
+
+            sdkRoot = CachedDotnetSdkRootPath;
+        }
+
+        if (string.IsNullOrWhiteSpace(sdkRoot) || !Directory.Exists(sdkRoot))
+        {
+            return;
+        }
+
+        foreach (var dll in Directory.EnumerateFiles(sdkRoot, "NuGet*.dll"))
+        {
+            var destination = Path.Combine(AppContext.BaseDirectory, Path.GetFileName(dll));
+            if (File.Exists(destination))
+            {
+                continue;
+            }
+
+            try
+            {
+                File.Copy(dll, destination, overwrite: false);
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    private static bool TryResolveDotnetSdkSdksPath(string? globalJsonPath, out string? sdksPath, out string? sdkVersion)
+    {
+        sdksPath = null;
+        sdkVersion = null;
+
+        if (!TryGetDotnetSdks(out var sdks, out _))
+        {
+            return false;
+        }
+
+        DotnetSdkInfo? chosen = null;
+        var requestedVersion = TryReadGlobalJsonSdkVersion(globalJsonPath);
+        if (!string.IsNullOrWhiteSpace(requestedVersion) && Version.TryParse(requestedVersion, out var requested))
+        {
+            chosen = sdks.FirstOrDefault(sdk => sdk.Version == requested);
+        }
+
+        chosen ??= sdks
+            .OrderByDescending(sdk => sdk.Version)
+            .FirstOrDefault();
+
+        if (chosen == null)
+        {
+            return false;
+        }
+
+        var candidate = Path.Combine(chosen.Path, "Sdks");
+        if (!Directory.Exists(candidate))
+        {
+            return false;
+        }
+
+        sdksPath = candidate;
+        sdkVersion = chosen.Version.ToString();
+        return true;
+    }
+
+    private static string? FindGlobalJsonPath(string? projectPath, string? solutionDir)
+    {
+        var startDir = !string.IsNullOrWhiteSpace(solutionDir)
+            ? solutionDir
+            : Path.GetDirectoryName(projectPath);
+
+        if (string.IsNullOrWhiteSpace(startDir))
+        {
+            return null;
+        }
+
+        var current = startDir;
+        while (!string.IsNullOrWhiteSpace(current))
+        {
+            var candidate = Path.Combine(current, "global.json");
+            if (File.Exists(candidate))
+            {
+                return candidate;
+            }
+
+            var parent = Directory.GetParent(current);
+            current = parent?.FullName;
+        }
+
+        return null;
+    }
+
+    private static string? TryReadGlobalJsonSdkVersion(string? globalJsonPath)
+    {
+        if (string.IsNullOrWhiteSpace(globalJsonPath) || !File.Exists(globalJsonPath))
+        {
+            return null;
+        }
+
+        try
+        {
+            using var stream = File.OpenRead(globalJsonPath);
+            using var doc = JsonDocument.Parse(stream);
+            if (doc.RootElement.TryGetProperty("sdk", out var sdkElement)
+                && sdkElement.TryGetProperty("version", out var versionElement)
+                && versionElement.ValueKind == JsonValueKind.String)
+            {
+                return versionElement.GetString();
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        return null;
+    }
+
     private static bool PrepareMsBuild()
     {
         if (MsBuildRegistrationAttempted)
@@ -1586,6 +2468,17 @@ internal static class Program
         }
 
         return success;
+    }
+
+    private static void LogMsBuildEvaluationFailure(string message)
+    {
+        if (MsBuildEvaluationLogged)
+        {
+            return;
+        }
+
+        Console.Error.WriteLine($"MSBuild evaluation failed: {message}");
+        MsBuildEvaluationLogged = true;
     }
 
     private static bool IsUiaDisabled()
@@ -1698,7 +2591,7 @@ internal static class Program
         var vswherePath = GetVswherePath();
         if (!string.IsNullOrWhiteSpace(vswherePath))
         {
-            var arguments = "-latest -products * -requires Microsoft.Component.MSBuild -find \"MSBuild\\**\\Bin\\MSBuild.exe\" -prerelease";
+            var arguments = "-latest -products * -requires Microsoft.Component.MSBuild -find \"MSBuild\\**\\Bin\\MSBuild.exe\"";
             if (TryRunProcess(vswherePath, arguments, out var stdout, out var stderr))
             {
                 var first = stdout
@@ -1720,9 +2613,33 @@ internal static class Program
             {
                 error = stderr.Trim();
             }
+
+            var prereleaseArguments = $"{arguments} -prerelease";
+            if (TryRunProcess(vswherePath, prereleaseArguments, out var prereleaseOut, out var prereleaseErr))
+            {
+                var first = prereleaseOut
+                    .Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries)
+                    .Select(line => line.Trim())
+                    .FirstOrDefault(line => !string.IsNullOrWhiteSpace(line));
+
+                if (!string.IsNullOrWhiteSpace(first) && File.Exists(first))
+                {
+                    msbuildPath = Path.GetDirectoryName(first);
+                    if (!string.IsNullOrWhiteSpace(msbuildPath))
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(prereleaseErr))
+            {
+                error = string.IsNullOrWhiteSpace(error) ? prereleaseErr.Trim() : error;
+            }
         }
 
-        foreach (var root in GetCandidateVisualStudioRoots())
+        foreach (var root in GetCandidateVisualStudioRoots()
+            .OrderBy(path => IsPrereleasePath(path)))
         {
             var candidate = Path.Combine(root, "MSBuild", "Current", "Bin");
             if (File.Exists(Path.Combine(candidate, "MSBuild.exe")))
@@ -1865,14 +2782,18 @@ internal static class Program
             globals["Platform"] = NormalizePlatformName(platform);
         }
 
+        var projectPath = TryGetValue(() => (string?)project?.FullName)
+            ?? TryGetValue(() => (string?)project?.FileName);
+
         var solutionPath = TryGetValue(() => (string?)project?.DTE?.Solution?.FullName);
+        string? solutionDir = null;
         if (!string.IsNullOrWhiteSpace(solutionPath))
         {
             globals["SolutionPath"] = solutionPath;
             globals["SolutionName"] = Path.GetFileNameWithoutExtension(solutionPath);
             globals["SolutionFileName"] = Path.GetFileName(solutionPath);
 
-            var solutionDir = Path.GetDirectoryName(solutionPath);
+            solutionDir = Path.GetDirectoryName(solutionPath);
             if (!string.IsNullOrWhiteSpace(solutionDir))
             {
                 if (!solutionDir.EndsWith(Path.DirectorySeparatorChar))
@@ -1882,6 +2803,13 @@ internal static class Program
 
                 globals["SolutionDir"] = solutionDir;
             }
+        }
+
+        EnsureDotnetSdkEnvironment(projectPath, solutionDir);
+        EnsureNuGetAssembliesPresent();
+        if (!string.IsNullOrWhiteSpace(CachedDotnetSdksPath))
+        {
+            globals["MSBuildSDKsPath"] = CachedDotnetSdksPath;
         }
 
         return globals;
@@ -3805,6 +4733,7 @@ internal static class Program
 
     private enum PropertySource
     {
+        UserFile = -2,
         UiAutomation = -1,
         MsBuild = 0,
         DteDescriptor = 1,
@@ -3821,6 +4750,18 @@ internal static class Program
 
         public string Name { get; }
         public object? Value { get; }
+    }
+
+    private sealed class DotnetSdkInfo
+    {
+        public DotnetSdkInfo(Version version, string path)
+        {
+            Version = version;
+            Path = path;
+        }
+
+        public Version Version { get; }
+        public string Path { get; }
     }
 
     private sealed class MsBuildEvaluation : IDisposable
